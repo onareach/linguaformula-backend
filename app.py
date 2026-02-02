@@ -21,7 +21,9 @@ CORS(app, origins=[
     "http://localhost:3000",  # Local development
     "https://linguaformula.com",  # Production domain
     "https://www.linguaformula.com",  # Production domain with www
-    "https://linguaformula.vercel.app"  # Deployed Vercel site (if different from custom domain)
+    "https://linguaformula.vercel.app",  # Deployed Vercel site (if different from custom domain)
+    "https://frontend-4y57xooet-david-longs-projects-14094a66.vercel.app",  # Current Vercel deployment
+    "https://*.vercel.app"  # All Vercel preview deployments
 ])
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
