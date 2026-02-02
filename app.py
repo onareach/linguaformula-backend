@@ -23,7 +23,8 @@ CORS(app, origins=[
     "https://www.linguaformula.com",  # Production domain with www
     "https://linguaformula.vercel.app",  # Deployed Vercel site (if different from custom domain)
     "https://frontend-4y57xooet-david-longs-projects-14094a66.vercel.app",  # Vercel deployment
-    "https://frontend-ebv9w8qm1-david-longs-projects-14094a66.vercel.app"  # Latest Vercel deployment
+    "https://frontend-ebv9w8qm1-david-longs-projects-14094a66.vercel.app",  # Vercel deployment
+    "https://frontend-mauve-three-67.vercel.app"  # Current Vercel deployment
 ])
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
