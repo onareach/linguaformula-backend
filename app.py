@@ -1,0 +1,436 @@
+# app.py
+# This app.py was created in order to expose an API endpoint for
+# Vercel Next.js to call
+# The Heroku API URL will be configured when deploying
+# The Heroku PostgreSQL login will be: heroku pg:psql -a [app-name]
+
+from flask import Flask, jsonify, request
+from flask_cors import CORS
+import psycopg2
+import os
+import openai
+import base64
+from PIL import Image
+import io
+import pytesseract
+
+app = Flask(__name__)
+
+# Below are the local host and Vercel production URL origins are permitted.
+CORS(app, origins=[
+    "http://localhost:3000",  # Local development
+    "https://linguaformula.com",  # Production domain
+    "https://www.linguaformula.com",  # Production domain with www
+    "https://linguaformula.vercel.app"  # Deployed Vercel site (if different from custom domain)
+])
+
+DATABASE_URL = os.environ.get("DATABASE_URL")
+# Fallback to local database if DATABASE_URL is not set
+if not DATABASE_URL:
+    DATABASE_URL = "postgresql://dev_user:dev123@localhost:5432/linguaformula?sslmode=disable"
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+
+def get_formulas():
+    # Use sslmode=require for production (Heroku uses postgres://), disable for local development
+    # Heroku DATABASE_URL starts with postgres://, local uses postgresql://
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, formula_name, latex, display_order, formula_description, english_verbalization FROM formula ORDER BY display_order;")
+    formulas = cursor.fetchall()
+    result = [{"id": row[0], "formula_name": row[1], "latex": row[2], "display_order": row[3], 
+               "formula_description": row[4], "english_verbalization": row[5]} for row in formulas]
+    cursor.close()
+    conn.close()
+    return result
+
+# Function to fetch a single formula by ID
+def get_formula_by_id(formula_id):
+    # Use sslmode=require for production (Heroku uses postgres://), disable for local development
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, formula_name, latex, display_order, formula_description, english_verbalization FROM formula WHERE id = %s;", (formula_id,))
+    formula = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if formula:
+        return {
+            "id": formula[0],
+            "formula_name": formula[1],
+            "latex": formula[2],
+            "display_order": formula[3],
+            "formula_description": formula[4],
+            "english_verbalization": formula[5]
+        }
+    else:
+        return None
+
+def get_applications():
+    # Use sslmode=require for production (Heroku uses postgres://), disable for local development
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title, problem_text, subject_area, image_filename, image_text, created_at FROM application ORDER BY created_at DESC;")
+    applications = cursor.fetchall()
+    result = [{"id": row[0], "title": row[1], "problem_text": row[2], "subject_area": row[3], 
+               "image_filename": row[4], "image_text": row[5], "created_at": row[6].isoformat() if row[6] else None} for row in applications]
+    cursor.close()
+    conn.close()
+    return result
+
+def get_application_by_id(application_id):
+    # Use sslmode=require for production (Heroku uses postgres://), disable for local development
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, title, problem_text, subject_area, image_filename, image_text, created_at FROM application WHERE id = %s;", (application_id,))
+    application = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    
+    if application:
+        return {
+            "id": application[0],
+            "title": application[1],
+            "problem_text": application[2],
+            "subject_area": application[3],
+            "image_filename": application[4],
+            "image_text": application[5],
+            "created_at": application[6].isoformat() if application[6] else None
+        }
+    else:
+        return None
+
+def get_application_formulas(application_id):
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT f.id, f.formula_name, f.latex, f.formula_description, af.relevance_score
+        FROM formula f
+        JOIN application_formula af ON f.id = af.formula_id
+        WHERE af.application_id = %s
+        ORDER BY af.relevance_score DESC NULLS LAST;
+    """, (application_id,))
+    formulas = cursor.fetchall()
+    result = [{"id": row[0], "formula_name": row[1], "latex": row[2], 
+               "formula_description": row[3], "relevance_score": row[4]} for row in formulas]
+    cursor.close()
+    conn.close()
+    return result
+
+def create_application(title, problem_text, subject_area=None, image_filename=None, image_data=None, image_text=None):
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO application (title, problem_text, subject_area, image_filename, image_data, image_text)
+        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id;
+    """, (title, problem_text, subject_area, image_filename, image_data, image_text))
+    application_id = cursor.fetchone()[0]
+    conn.commit()
+    cursor.close()
+    conn.close()
+    return application_id
+
+def extract_text_from_image(image_data):
+    """Extract text from image using OCR (Tesseract)"""
+    try:
+        image = Image.open(io.BytesIO(image_data))
+        text = pytesseract.image_to_string(image)
+        return text.strip()
+    except Exception as e:
+        print(f"OCR Error: {str(e)}")
+        return None
+
+def extract_text_with_openai(image_data):
+    """Extract and interpret text from image using OpenAI Vision API"""
+    try:
+        if not OPENAI_API_KEY:
+            return None
+        
+        # Convert image to base64
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-4-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Please extract and transcribe all text, mathematical expressions, diagrams, and problem descriptions from this image. Include any tables, formulas, or structured data. Format the output clearly and preserve the mathematical notation."
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{image_base64}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1000
+        )
+        
+        return response.choices[0].message.content
+    except Exception as e:
+        print(f"OpenAI Vision Error: {str(e)}")
+        return None
+
+def link_application_formula(application_id, formula_id, relevance_score=None):
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("""
+        INSERT INTO application_formula (application_id, formula_id, relevance_score)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (application_id, formula_id) 
+        DO UPDATE SET relevance_score = EXCLUDED.relevance_score;
+    """, (application_id, formula_id, relevance_score))
+    conn.commit()
+    cursor.close()
+    conn.close()
+
+# Route to fetch all formulas    
+@app.route('/api/formulas', methods=['GET'])
+def fetch_formulas():
+    try:
+        formulas = get_formulas()
+        return jsonify(formulas)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to fetch a single formula by ID
+@app.route('/api/formulas/<int:formula_id>', methods=['GET'])
+def fetch_formula_by_id(formula_id):
+    try:
+        formula = get_formula_by_id(formula_id)
+        if formula:
+            return jsonify(formula)
+        else:
+            return jsonify({"error": "Formula not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to fetch all applications
+@app.route('/api/applications', methods=['GET'])
+def fetch_applications():
+    try:
+        applications = get_applications()
+        return jsonify(applications)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to fetch a single application by ID
+@app.route('/api/applications/<int:application_id>', methods=['GET'])
+def fetch_application_by_id(application_id):
+    try:
+        application = get_application_by_id(application_id)
+        if application:
+            return jsonify(application)
+        else:
+            return jsonify({"error": "Application not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to fetch formulas linked to an application
+@app.route('/api/applications/<int:application_id>/formulas', methods=['GET'])
+def fetch_application_formulas(application_id):
+    try:
+        formulas = get_application_formulas(application_id)
+        return jsonify(formulas)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to create a new application
+@app.route('/api/applications', methods=['POST'])
+def create_new_application():
+    try:
+        data = request.get_json()
+        if not data or 'title' not in data or 'problem_text' not in data:
+            return jsonify({"error": "Title and problem_text are required"}), 400
+        
+        application_id = create_application(
+            data['title'],
+            data['problem_text'],
+            data.get('subject_area')
+        )
+        
+        return jsonify({"id": application_id, "message": "Application created successfully"}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to link an application to a formula
+@app.route('/api/applications/<int:application_id>/formulas/<int:formula_id>', methods=['POST'])
+def link_application_to_formula(application_id, formula_id):
+    try:
+        data = request.get_json() or {}
+        relevance_score = data.get('relevance_score')
+        
+        link_application_formula(application_id, formula_id, relevance_score)
+        
+        return jsonify({"message": "Application linked to formula successfully"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to get AI suggestions for formula mapping
+@app.route('/api/applications/<int:application_id>/suggest-formulas', methods=['POST'])
+def suggest_formulas_for_application(application_id):
+    try:
+        if not OPENAI_API_KEY:
+            return jsonify({"error": "OpenAI API key not configured"}), 500
+        
+        application = get_application_by_id(application_id)
+        if not application:
+            return jsonify({"error": "Application not found"}), 404
+        
+        formulas = get_formulas()
+        
+        # Create prompt for OpenAI
+        formula_list = "\n".join([f"ID {f['id']}: {f['formula_name']} - {f['latex']}" for f in formulas])
+        
+        prompt = f"""
+        Given this problem/application:
+        Title: {application['title']}
+        Problem: {application['problem_text']}
+        Subject: {application.get('subject_area', 'Unknown')}
+        
+        And these available formulas:
+        {formula_list}
+        
+        Please suggest which formulas would be most relevant for solving this problem. 
+        Return a JSON array with objects containing 'formula_id' and 'relevance_score' (0-1).
+        Only include formulas that are actually relevant.
+        """
+        
+        response = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3
+        )
+        
+        # Parse the AI response
+        ai_suggestions = response.choices[0].message.content
+        
+        return jsonify({"suggestions": ai_suggestions})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to upload and process image for application creation
+@app.route('/api/applications/upload-image', methods=['POST'])
+def upload_and_process_image():
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        if file.filename == '':
+            return jsonify({"error": "No image file selected"}), 400
+        
+        # Read image data
+        image_data = file.read()
+        
+        # Extract text using both OCR and OpenAI Vision
+        ocr_text = extract_text_from_image(image_data)
+        ai_text = extract_text_with_openai(image_data)
+        
+        # Combine results, preferring AI text if available
+        extracted_text = ai_text if ai_text else ocr_text
+        
+        return jsonify({
+            "image_filename": file.filename,
+            "extracted_text": extracted_text,
+            "ocr_text": ocr_text,
+            "ai_text": ai_text,
+            "message": "Image processed successfully"
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to create application with image
+@app.route('/api/applications/with-image', methods=['POST'])
+def create_application_with_image():
+    try:
+        if 'image' not in request.files:
+            return jsonify({"error": "No image file provided"}), 400
+        
+        file = request.files['image']
+        title = request.form.get('title')
+        problem_text = request.form.get('problem_text', '')
+        subject_area = request.form.get('subject_area')
+        
+        if not title:
+            return jsonify({"error": "Title is required"}), 400
+        
+        # Read and process image
+        image_data = file.read()
+        
+        # Extract text using both methods
+        ocr_text = extract_text_from_image(image_data)
+        ai_text = extract_text_with_openai(image_data)
+        
+        # Use AI text if available, otherwise OCR
+        extracted_text = ai_text if ai_text else ocr_text
+        
+        # If problem_text is empty, use extracted text
+        if not problem_text and extracted_text:
+            problem_text = extracted_text
+        
+        # Create application with image data
+        application_id = create_application(
+            title=title,
+            problem_text=problem_text,
+            subject_area=subject_area,
+            image_filename=file.filename,
+            image_data=image_data,
+            image_text=extracted_text
+        )
+        
+        return jsonify({
+            "id": application_id,
+            "message": "Application created successfully with image",
+            "extracted_text": extracted_text
+        }), 201
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to get image for an application
+@app.route('/api/applications/<int:application_id>/image', methods=['GET'])
+def get_application_image(application_id):
+    try:
+        sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+        conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+        cursor = conn.cursor()
+        cursor.execute("SELECT image_data, image_filename FROM application WHERE id = %s;", (application_id,))
+        result = cursor.fetchone()
+        cursor.close()
+        conn.close()
+        
+        if not result or not result[0]:
+            return jsonify({"error": "No image found for this application"}), 404
+        
+        image_data, filename = result
+        
+        # Return image as base64 encoded string
+        image_base64 = base64.b64encode(image_data).decode('utf-8')
+        
+        return jsonify({
+            "image_data": image_base64,
+            "filename": filename
+        }), 200
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == '__main__':
+    app.run(debug=True)
