@@ -11,7 +11,7 @@ if not DATABASE_URL:
     print("❌ DATABASE_URL not found")
     sys.exit(1)
 
-# Initial schema SQL
+# Initial schema SQL (includes enhancements from schema_migration)
 INITIAL_SCHEMA = """
 CREATE TABLE IF NOT EXISTS formula (
     id SERIAL PRIMARY KEY,
@@ -20,6 +20,11 @@ CREATE TABLE IF NOT EXISTS formula (
     display_order INTEGER,
     formula_description TEXT,
     english_verbalization TEXT,
+    category VARCHAR(50),
+    difficulty_level VARCHAR(20),
+    assumptions TEXT,
+    formula_expression TEXT,
+    output_target VARCHAR(100),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -40,6 +45,10 @@ CREATE TABLE IF NOT EXISTS application_formula (
     application_id INTEGER NOT NULL REFERENCES application(id) ON DELETE CASCADE,
     formula_id INTEGER NOT NULL REFERENCES formula(id) ON DELETE CASCADE,
     relevance_score FLOAT,
+    variable_mapping JSONB,
+    solution_steps TEXT,
+    confidence_score FLOAT,
+    missing_variables TEXT[],
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (application_id, formula_id)
 );
@@ -59,8 +68,33 @@ def main():
     
     # Execute schema creation
     print("  → Creating tables...")
-    cursor.execute(INITIAL_SCHEMA)
+    # Split by semicolons and execute each statement
+    statements = [s.strip() for s in INITIAL_SCHEMA.split(';') if s.strip() and not s.strip().startswith('--')]
+    for statement in statements:
+        if statement:
+            try:
+                cursor.execute(statement)
+            except Exception as e:
+                # Ignore "already exists" errors
+                if "already exists" not in str(e).lower():
+                    print(f"    ⚠️  {e}")
     conn.commit()
+    
+    # Add additional columns if they don't exist (from schema_migration)
+    print("  → Adding enhancement columns...")
+    try:
+        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS category VARCHAR(50);")
+        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS difficulty_level VARCHAR(20);")
+        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS assumptions TEXT;")
+        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS formula_expression TEXT;")
+        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS output_target VARCHAR(100);")
+        cursor.execute("ALTER TABLE application_formula ADD COLUMN IF NOT EXISTS variable_mapping JSONB;")
+        cursor.execute("ALTER TABLE application_formula ADD COLUMN IF NOT EXISTS solution_steps TEXT;")
+        cursor.execute("ALTER TABLE application_formula ADD COLUMN IF NOT EXISTS confidence_score FLOAT;")
+        cursor.execute("ALTER TABLE application_formula ADD COLUMN IF NOT EXISTS missing_variables TEXT[];")
+        conn.commit()
+    except Exception as e:
+        print(f"    ⚠️  {e}")
     
     # Check if tables exist
     cursor.execute("""
