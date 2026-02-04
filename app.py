@@ -18,7 +18,8 @@ app = Flask(__name__)
 
 # Below are the local host and Vercel production URL origins are permitted.
 CORS(app, origins=[
-    "http://localhost:3000",  # Local development
+    "http://localhost:3000",  # Local development (default port)
+    "http://localhost:3001",  # Local development (alternate port)
     "https://linguaformula.com",  # Production domain
     "https://www.linguaformula.com",  # Production domain with www
     "https://linguaformula.vercel.app",  # Deployed Vercel site (if different from custom domain)
