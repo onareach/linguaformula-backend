@@ -11,20 +11,18 @@ if not DATABASE_URL:
     print("❌ DATABASE_URL not found")
     sys.exit(1)
 
-# Initial schema SQL (includes enhancements from schema_migration)
+# Initial schema SQL
+# NOTE: This script is a legacy helper and is not used by the normal deploy flow.
+# Keep it aligned with the *current* schema conventions (tbl_* tables).
 INITIAL_SCHEMA = """
-CREATE TABLE IF NOT EXISTS formula (
-    id SERIAL PRIMARY KEY,
+CREATE TABLE IF NOT EXISTS tbl_formula (
+    formula_id SERIAL PRIMARY KEY,
     formula_name VARCHAR(100) NOT NULL,
     latex TEXT NOT NULL,
     display_order INTEGER,
     formula_description TEXT,
     english_verbalization TEXT,
-    category VARCHAR(50),
-    difficulty_level VARCHAR(20),
-    assumptions TEXT,
-    formula_expression TEXT,
-    output_target VARCHAR(100),
+    symbolic_verbalization TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
@@ -43,7 +41,7 @@ CREATE TABLE IF NOT EXISTS application (
 
 CREATE TABLE IF NOT EXISTS application_formula (
     application_id INTEGER NOT NULL REFERENCES application(id) ON DELETE CASCADE,
-    formula_id INTEGER NOT NULL REFERENCES formula(id) ON DELETE CASCADE,
+    formula_id INTEGER NOT NULL REFERENCES tbl_formula(formula_id) ON DELETE CASCADE,
     relevance_score FLOAT,
     variable_mapping JSONB,
     solution_steps TEXT,
@@ -53,8 +51,8 @@ CREATE TABLE IF NOT EXISTS application_formula (
     PRIMARY KEY (application_id, formula_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_formula_display_order ON formula(display_order);
-CREATE INDEX IF NOT EXISTS idx_formula_name ON formula(formula_name);
+CREATE INDEX IF NOT EXISTS idx_tbl_formula_display_order ON tbl_formula(display_order);
+CREATE INDEX IF NOT EXISTS idx_tbl_formula_name ON tbl_formula(formula_name);
 CREATE INDEX IF NOT EXISTS idx_application_subject_area ON application(subject_area);
 CREATE INDEX IF NOT EXISTS idx_application_formula_app_id ON application_formula(application_id);
 CREATE INDEX IF NOT EXISTS idx_application_formula_formula_id ON application_formula(formula_id);
@@ -80,14 +78,9 @@ def main():
                     print(f"    ⚠️  {e}")
     conn.commit()
     
-    # Add additional columns if they don't exist (from schema_migration)
-    print("  → Adding enhancement columns...")
+    # Add application_formula enhancement columns (these exist in current schema)
+    print("  → Adding application_formula enhancement columns...")
     try:
-        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS category VARCHAR(50);")
-        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS difficulty_level VARCHAR(20);")
-        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS assumptions TEXT;")
-        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS formula_expression TEXT;")
-        cursor.execute("ALTER TABLE formula ADD COLUMN IF NOT EXISTS output_target VARCHAR(100);")
         cursor.execute("ALTER TABLE application_formula ADD COLUMN IF NOT EXISTS variable_mapping JSONB;")
         cursor.execute("ALTER TABLE application_formula ADD COLUMN IF NOT EXISTS solution_steps TEXT;")
         cursor.execute("ALTER TABLE application_formula ADD COLUMN IF NOT EXISTS confidence_score FLOAT;")
@@ -99,7 +92,7 @@ def main():
     # Check if tables exist
     cursor.execute("""
         SELECT COUNT(*) FROM information_schema.tables 
-        WHERE table_name IN ('formula', 'application', 'application_formula');
+        WHERE table_name IN ('tbl_formula', 'application', 'application_formula');
     """)
     table_count = cursor.fetchone()[0]
     

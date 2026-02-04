@@ -5,12 +5,7 @@
 -- PHASE 1: Add new columns to existing tables (non-breaking changes)
 -- ============================================================================
 
--- Enhance Formula table with new metadata columns
-ALTER TABLE formula ADD COLUMN IF NOT EXISTS category VARCHAR(50);
-ALTER TABLE formula ADD COLUMN IF NOT EXISTS difficulty_level VARCHAR(20);
-ALTER TABLE formula ADD COLUMN IF NOT EXISTS assumptions TEXT;
 ALTER TABLE formula ADD COLUMN IF NOT EXISTS formula_expression TEXT;
-ALTER TABLE formula ADD COLUMN IF NOT EXISTS output_target VARCHAR(100);
 
 -- Enhance application_formula table with new relationship data
 ALTER TABLE application_formula ADD COLUMN IF NOT EXISTS variable_mapping JSONB;
@@ -25,7 +20,7 @@ ALTER TABLE application_formula ADD COLUMN IF NOT EXISTS missing_variables TEXT[
 -- Formula Variables Table - Track input/output parameters
 CREATE TABLE IF NOT EXISTS formula_variables (
     id SERIAL PRIMARY KEY,
-    formula_id INTEGER NOT NULL REFERENCES formula(id) ON DELETE CASCADE,
+    formula_id INTEGER NOT NULL REFERENCES tbl_formula(formula_id) ON DELETE CASCADE,
     variable_name VARCHAR(50) NOT NULL,
     variable_type VARCHAR(20) NOT NULL CHECK (variable_type IN ('input', 'output')),
     description TEXT,
@@ -37,8 +32,8 @@ CREATE TABLE IF NOT EXISTS formula_variables (
 -- Formula Relationships Table - Helper formula dependencies
 CREATE TABLE IF NOT EXISTS formula_relationships (
     id SERIAL PRIMARY KEY,
-    main_formula_id INTEGER NOT NULL REFERENCES formula(id) ON DELETE CASCADE,
-    helper_formula_id INTEGER NOT NULL REFERENCES formula(id) ON DELETE CASCADE,
+    main_formula_id INTEGER NOT NULL REFERENCES tbl_formula(formula_id) ON DELETE CASCADE,
+    helper_formula_id INTEGER NOT NULL REFERENCES tbl_formula(formula_id) ON DELETE CASCADE,
     relationship_type VARCHAR(50) NOT NULL CHECK (relationship_type IN ('prerequisite', 'helper', 'alternative')),
     usage_context TEXT,
     sequence_order INTEGER,
@@ -49,7 +44,7 @@ CREATE TABLE IF NOT EXISTS formula_relationships (
 -- Formula Keywords Table - Search terms and tags
 CREATE TABLE IF NOT EXISTS formula_keywords (
     id SERIAL PRIMARY KEY,
-    formula_id INTEGER NOT NULL REFERENCES formula(id) ON DELETE CASCADE,
+    formula_id INTEGER NOT NULL REFERENCES tbl_formula(formula_id) ON DELETE CASCADE,
     keyword VARCHAR(100) NOT NULL,
     keyword_type VARCHAR(30) NOT NULL CHECK (keyword_type IN ('subject', 'concept', 'method', 'application')),
     weight FLOAT DEFAULT 1.0 CHECK (weight >= 0.1 AND weight <= 1.0),
@@ -59,7 +54,7 @@ CREATE TABLE IF NOT EXISTS formula_keywords (
 -- Formula Examples Table - Built-in example problems
 CREATE TABLE IF NOT EXISTS formula_examples (
     id SERIAL PRIMARY KEY,
-    formula_id INTEGER NOT NULL REFERENCES formula(id) ON DELETE CASCADE,
+    formula_id INTEGER NOT NULL REFERENCES tbl_formula(formula_id) ON DELETE CASCADE,
     example_title VARCHAR(200),
     example_problem TEXT NOT NULL,
     given_values JSONB,
@@ -72,7 +67,7 @@ CREATE TABLE IF NOT EXISTS formula_examples (
 -- Formula Prerequisites Table - Required knowledge
 CREATE TABLE IF NOT EXISTS formula_prerequisites (
     id SERIAL PRIMARY KEY,
-    formula_id INTEGER NOT NULL REFERENCES formula(id) ON DELETE CASCADE,
+    formula_id INTEGER NOT NULL REFERENCES tbl_formula(formula_id) ON DELETE CASCADE,
     prerequisite_concept VARCHAR(200) NOT NULL,
     importance_level VARCHAR(20) DEFAULT 'medium' CHECK (importance_level IN ('low', 'medium', 'high', 'critical')),
     description TEXT,
@@ -105,8 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_formula_examples_difficulty ON formula_examples(d
 CREATE INDEX IF NOT EXISTS idx_formula_prerequisites_formula_id ON formula_prerequisites(formula_id);
 
 -- Indexes for enhanced formula table
-CREATE INDEX IF NOT EXISTS idx_formula_category ON formula(category);
-CREATE INDEX IF NOT EXISTS idx_formula_difficulty ON formula(difficulty_level);
+-- (category/difficulty/assumptions/output_target were removed from tbl_formula)
 
 -- ============================================================================
 -- PHASE 4: Insert sample data for Bayes Theorem (demonstration)
@@ -120,20 +114,12 @@ DECLARE
     bayes_formula_id INTEGER;
 BEGIN
     -- Find Bayes Theorem formula (adjust the search criteria as needed)
-    SELECT id INTO bayes_formula_id 
-    FROM formula 
+    SELECT formula_id INTO bayes_formula_id 
+    FROM tbl_formula 
     WHERE LOWER(formula_name) LIKE '%bayes%' 
     LIMIT 1;
     
     IF bayes_formula_id IS NOT NULL THEN
-        -- Update formula with enhanced metadata
-        UPDATE formula 
-        SET category = 'Probability',
-            difficulty_level = 'intermediate',
-            assumptions = 'Events A and B are defined on the same sample space',
-            output_target = 'P(B|A)'
-        WHERE id = bayes_formula_id;
-        
         -- Insert variables
         INSERT INTO formula_variables (formula_id, variable_name, variable_type, description) VALUES
         (bayes_formula_id, 'P(A|B)', 'input', 'Probability of A given B'),
@@ -193,7 +179,7 @@ SELECT
     is_nullable
 FROM information_schema.columns 
 WHERE table_name = 'formula' 
-    AND column_name IN ('category', 'difficulty_level', 'assumptions', 'formula_expression', 'output_target')
+    AND column_name IN ('formula_expression')
 ORDER BY column_name;
 
 -- Count records in new tables
