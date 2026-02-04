@@ -50,6 +50,47 @@ def get_formulas():
     conn.close()
     return result
 
+def get_formulas_by_disciplines(discipline_ids, include_children=True):
+    """Get formulas filtered by discipline IDs, optionally including child disciplines."""
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    
+    if include_children:
+        # Get all child discipline IDs for the selected parent disciplines
+        cursor.execute("""
+            WITH RECURSIVE discipline_tree AS (
+                SELECT discipline_id FROM tbl_discipline WHERE discipline_id = ANY(%s)
+                UNION ALL
+                SELECT d.discipline_id 
+                FROM tbl_discipline d
+                INNER JOIN discipline_tree dt ON d.discipline_parent_id = dt.discipline_id
+            )
+            SELECT DISTINCT f.formula_id, f.formula_name, f.latex, f.display_order, 
+                   f.formula_description, f.english_verbalization, f.symbolic_verbalization
+            FROM tbl_formula f
+            INNER JOIN tbl_formula_discipline fd ON f.formula_id = fd.formula_id
+            INNER JOIN discipline_tree dt ON fd.discipline_id = dt.discipline_id
+            ORDER BY f.display_order;
+        """, (discipline_ids,))
+    else:
+        # Only get formulas directly linked to the selected disciplines
+        cursor.execute("""
+            SELECT DISTINCT f.formula_id, f.formula_name, f.latex, f.display_order,
+                   f.formula_description, f.english_verbalization, f.symbolic_verbalization
+            FROM tbl_formula f
+            INNER JOIN tbl_formula_discipline fd ON f.formula_id = fd.formula_id
+            WHERE fd.discipline_id = ANY(%s)
+            ORDER BY f.display_order;
+        """, (discipline_ids,))
+    
+    formulas = cursor.fetchall()
+    result = [{"id": row[0], "formula_name": row[1], "latex": row[2], "display_order": row[3], 
+               "formula_description": row[4], "english_verbalization": row[5], "symbolic_verbalization": row[6]} for row in formulas]
+    cursor.close()
+    conn.close()
+    return result
+
 # Function to fetch a single formula by ID
 def get_formula_by_id(formula_id):
     # Use sslmode=require for production (Heroku uses postgres://), disable for local development
@@ -202,11 +243,62 @@ def link_application_formula(application_id, formula_id, relevance_score=None):
     cursor.close()
     conn.close()
 
-# Route to fetch all formulas    
+# Route to fetch all disciplines with hierarchy
+@app.route('/api/disciplines', methods=['GET'])
+def fetch_disciplines():
+    try:
+        sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+        conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+        cursor = conn.cursor()
+        
+        # Fetch all disciplines with parent info and formula counts
+        cursor.execute("""
+            SELECT 
+                d.discipline_id,
+                d.discipline_name,
+                d.discipline_handle,
+                d.discipline_description,
+                d.discipline_parent_id,
+                COALESCE(p.discipline_name, NULL) as parent_name,
+                COALESCE(p.discipline_handle, NULL) as parent_handle,
+                (SELECT COUNT(*) FROM tbl_formula_discipline WHERE discipline_id = d.discipline_id) as formula_count
+            FROM tbl_discipline d
+            LEFT JOIN tbl_discipline p ON d.discipline_parent_id = p.discipline_id
+            ORDER BY COALESCE(d.discipline_parent_id, 0), d.discipline_name;
+        """)
+        
+        disciplines = cursor.fetchall()
+        result = []
+        for row in disciplines:
+            result.append({
+                "id": row[0],
+                "name": row[1],
+                "handle": row[2],
+                "description": row[3],
+                "parent_id": row[4],
+                "parent_name": row[5],
+                "parent_handle": row[6],
+                "formula_count": row[7]
+            })
+        
+        cursor.close()
+        conn.close()
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# Route to fetch all formulas (with optional discipline filtering)
 @app.route('/api/formulas', methods=['GET'])
 def fetch_formulas():
     try:
-        formulas = get_formulas()
+        # Check for discipline filter in query parameters
+        discipline_ids = request.args.getlist('discipline_id', type=int)
+        include_children = request.args.get('include_children', 'true').lower() == 'true'
+        
+        if discipline_ids:
+            formulas = get_formulas_by_disciplines(discipline_ids, include_children)
+        else:
+            formulas = get_formulas()
         return jsonify(formulas)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
