@@ -151,7 +151,7 @@ def run_migration():
             print("✗ symbolic_verbalization column NOT found")
         
         # Check new tables exist
-        for table in ['tbl_disciplines', 'tbl_formula_disciplines']:
+        for table in ['tbl_discipline', 'tbl_formula_discipline']:
             cur.execute("""
                 SELECT EXISTS (
                     SELECT 1 FROM information_schema.tables 
