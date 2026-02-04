@@ -5,12 +5,14 @@ from flask_sqlalchemy import SQLAlchemy
 db = SQLAlchemy()
 
 class Formula(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
+    __tablename__ = 'tbl_formula'
+    formula_id = db.Column(db.Integer, primary_key=True)
     formula_name = db.Column(db.String(100), nullable=False)
     latex = db.Column(db.Text, nullable=False)
     display_order = db.Column(db.Integer)
     formula_description = db.Column(db.Text)
     english_verbalization = db.Column(db.Text)
+    symbolic_verbalization = db.Column(db.Text)
 
     def __repr__(self):
         return f"<Formula {self.formula_name}>"
@@ -33,7 +35,7 @@ class Application(db.Model):
 # Association table for many-to-many relationship between Applications and Formulas
 application_formula = db.Table('application_formula',
     db.Column('application_id', db.Integer, db.ForeignKey('application.id'), primary_key=True),
-    db.Column('formula_id', db.Integer, db.ForeignKey('formula.id'), primary_key=True),
+    db.Column('formula_id', db.Integer, db.ForeignKey('tbl_formula.formula_id'), primary_key=True),
     db.Column('relevance_score', db.Float),  # Optional: AI-generated relevance score
     db.Column('created_at', db.DateTime, default=db.func.current_timestamp())
 )

@@ -42,10 +42,10 @@ def get_formulas():
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, formula_name, latex, display_order, formula_description, english_verbalization FROM formula ORDER BY display_order;")
+    cursor.execute("SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization, symbolic_verbalization FROM tbl_formula ORDER BY display_order;")
     formulas = cursor.fetchall()
     result = [{"id": row[0], "formula_name": row[1], "latex": row[2], "display_order": row[3], 
-               "formula_description": row[4], "english_verbalization": row[5]} for row in formulas]
+               "formula_description": row[4], "english_verbalization": row[5], "symbolic_verbalization": row[6]} for row in formulas]
     cursor.close()
     conn.close()
     return result
@@ -56,7 +56,7 @@ def get_formula_by_id(formula_id):
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
-    cursor.execute("SELECT id, formula_name, latex, display_order, formula_description, english_verbalization FROM formula WHERE id = %s;", (formula_id,))
+    cursor.execute("SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization, symbolic_verbalization FROM tbl_formula WHERE formula_id = %s;", (formula_id,))
     formula = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -68,7 +68,8 @@ def get_formula_by_id(formula_id):
             "latex": formula[2],
             "display_order": formula[3],
             "formula_description": formula[4],
-            "english_verbalization": formula[5]
+            "english_verbalization": formula[5],
+            "symbolic_verbalization": formula[6]
         }
     else:
         return None
@@ -114,9 +115,9 @@ def get_application_formulas(application_id):
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT f.id, f.formula_name, f.latex, f.formula_description, af.relevance_score
-        FROM formula f
-        JOIN application_formula af ON f.id = af.formula_id
+        SELECT f.formula_id, f.formula_name, f.latex, f.formula_description, af.relevance_score
+        FROM tbl_formula f
+        JOIN application_formula af ON f.formula_id = af.formula_id
         WHERE af.application_id = %s
         ORDER BY af.relevance_score DESC NULLS LAST;
     """, (application_id,))
