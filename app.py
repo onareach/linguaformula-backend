@@ -98,7 +98,7 @@ def get_formula_by_id(formula_id):
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
-    cursor.execute("SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization, symbolic_verbalization FROM tbl_formula WHERE formula_id = %s;", (formula_id,))
+    cursor.execute("SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization, symbolic_verbalization, units, example, historical_context FROM tbl_formula WHERE formula_id = %s;", (formula_id,))
     formula = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -111,7 +111,10 @@ def get_formula_by_id(formula_id):
             "display_order": formula[3],
             "formula_description": formula[4],
             "english_verbalization": formula[5],
-            "symbolic_verbalization": formula[6]
+            "symbolic_verbalization": formula[6],
+            "units": formula[7],
+            "example": formula[8],
+            "historical_context": formula[9]
         }
     else:
         return None
