@@ -319,6 +319,68 @@ def fetch_formula_by_id(formula_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+def get_questions_by_formula_id(formula_id):
+    """Get all quiz questions linked to a formula (top-level only). Includes answers; multipart includes parts."""
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT q.question_id, q.question_type, q.stem, q.explanation, q.display_order
+        FROM tbl_question q
+        INNER JOIN tbl_formula_question fq ON fq.question_id = q.question_id
+        WHERE fq.formula_id = %s AND q.parent_question_id IS NULL
+        ORDER BY q.display_order, q.question_id;
+    """, (formula_id,))
+    rows = cursor.fetchall()
+    result = []
+    for r in rows:
+        qid, qtype, stem, explanation, display_order = r
+        # Answers for this question
+        cursor.execute("""
+            SELECT a.answer_id, a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+            FROM tbl_question_answer qa
+            INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+            WHERE qa.question_id = %s
+            ORDER BY qa.display_order, qa.question_answer_id;
+        """, (qid,))
+        answers = [{"answer_id": row[0], "answer_text": row[1], "answer_numeric": float(row[2]) if row[2] is not None else None, "is_correct": row[3], "display_order": row[4]} for row in cursor.fetchall()]
+        item = {"question_id": qid, "question_type": qtype, "stem": stem, "explanation": explanation, "display_order": display_order, "answers": answers}
+        if qtype == "multipart":
+            cursor.execute("""
+                SELECT question_id, part_label, stem, display_order
+                FROM tbl_question
+                WHERE parent_question_id = %s
+                ORDER BY display_order, question_id;
+            """, (qid,))
+            parts = []
+            for pr in cursor.fetchall():
+                pid, plabel, pstem, pord = pr
+                cursor.execute("""
+                    SELECT a.answer_id, a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+                    FROM tbl_question_answer qa
+                    INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+                    WHERE qa.question_id = %s
+                    ORDER BY qa.display_order;
+                """, (pid,))
+                part_answers = [{"answer_id": row[0], "answer_text": row[1], "answer_numeric": float(row[2]) if row[2] is not None else None, "is_correct": row[3], "display_order": row[4]} for row in cursor.fetchall()]
+                parts.append({"question_id": pid, "part_label": plabel, "stem": pstem, "display_order": pord, "answers": part_answers})
+            item["parts"] = parts
+        result.append(item)
+    cursor.close()
+    conn.close()
+    return result
+
+
+@app.route('/api/formulas/<int:formula_id>/questions', methods=['GET'])
+def fetch_formula_questions(formula_id):
+    try:
+        questions = get_questions_by_formula_id(formula_id)
+        return jsonify({"questions": questions})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # Route to fetch all applications
 @app.route('/api/applications', methods=['GET'])
 def fetch_applications():
