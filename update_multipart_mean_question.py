@@ -29,10 +29,10 @@ def run():
     """, ("%errors per 100 lines%",))
     row = cur.fetchone()
     if not row:
-        print("No multipart parent found (stem containing 'errors per 100 lines'). Nothing to update.")
+        msg = "No multipart parent found (stem containing 'errors per 100 lines'). Nothing to update."
         cur.close()
         conn.close()
-        return
+        return False, msg
     parent_id = row[0]
 
     # Get child parts (a, b, c)
@@ -73,7 +73,10 @@ def run():
     conn.commit()
     cur.close()
     conn.close()
-    print("Updated multipart mean question: now 2 parts (a) mean, (b) new mean after four more samples.")
+    return True, "Updated multipart mean question: now 2 parts (a) mean, (b) new mean after four more samples."
 
 if __name__ == "__main__":
-    run()
+    import sys
+    success, message = run()
+    print(message)
+    sys.exit(0 if success else 1)

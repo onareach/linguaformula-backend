@@ -7,6 +7,7 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 import psycopg2
+from update_multipart_mean_question import run as run_multipart_mean_update
 import os
 import openai
 import base64
@@ -379,6 +380,16 @@ def fetch_formula_questions(formula_id):
         return jsonify({"questions": questions})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/admin/update-multipart-mean', methods=['GET'])
+def admin_update_multipart_mean():
+    """One-off: run the multipart mean question update and return result (no heroku run timeout)."""
+    try:
+        success, message = run_multipart_mean_update()
+        return jsonify({"ok": success, "message": message})
+    except Exception as e:
+        return jsonify({"ok": False, "message": str(e)}), 500
 
 
 # Route to fetch all applications
