@@ -8,6 +8,7 @@ from flask import Flask, jsonify, request
 from flask_cors import CORS
 import psycopg2
 from update_multipart_mean_question import run as run_multipart_mean_update
+from seed_all_formula_questions import run as run_seed_all_formula_questions
 import os
 import openai
 import base64
@@ -390,6 +391,16 @@ def admin_update_multipart_mean():
         return jsonify({"ok": success, "message": message})
     except Exception as e:
         return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.route('/api/admin/seed-all-formula-questions', methods=['GET'])
+def admin_seed_all_formula_questions():
+    """Run seed_all_formula_questions (add one question per formula for formulas that don't have one). Returns count and message."""
+    try:
+        count_added, message = run_seed_all_formula_questions()
+        return jsonify({"ok": True, "added": count_added, "message": message})
+    except Exception as e:
+        return jsonify({"ok": False, "added": 0, "message": str(e)}), 500
 
 
 # Route to fetch all applications

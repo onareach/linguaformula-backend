@@ -86,6 +86,7 @@ QUESTION_SPECS = [
 ]
 
 def run():
+    """Returns (count_added, message)."""
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     db_url = DATABASE_URL.replace("postgres://", "postgresql://", 1) if DATABASE_URL.startswith("postgres://") else DATABASE_URL
     conn = psycopg2.connect(db_url, sslmode=sslmode)
@@ -171,7 +172,9 @@ def run():
     conn.commit()
     cur.close()
     conn.close()
-    print(f"Added {added} new formula question(s). Formulas that already had a question were skipped.")
+    msg = f"Added {added} new formula question(s). Formulas that already had a question were skipped."
+    print(msg)
+    return added, msg
 
 if __name__ == "__main__":
     run()
