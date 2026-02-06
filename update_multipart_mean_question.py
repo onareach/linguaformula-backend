@@ -21,15 +21,15 @@ def run():
     conn = psycopg2.connect(db_url, sslmode=sslmode)
     cur = conn.cursor()
 
-    # Find multipart parent linked to formula 198
+    # Find multipart parent by distinctive stem (works regardless of formula_id on production)
     cur.execute("""
-        SELECT q.question_id FROM tbl_question q
-        INNER JOIN tbl_formula_question fq ON fq.question_id = q.question_id
-        WHERE fq.formula_id = 198 AND q.question_type = 'multipart' AND q.parent_question_id IS NULL;
-    """)
+        SELECT question_id FROM tbl_question
+        WHERE question_type = 'multipart' AND parent_question_id IS NULL
+        AND stem LIKE %s;
+    """, ("%errors per 100 lines%",))
     row = cur.fetchone()
     if not row:
-        print("No multipart parent found for formula_id 198. Nothing to update.")
+        print("No multipart parent found (stem containing 'errors per 100 lines'). Nothing to update.")
         cur.close()
         conn.close()
         return
