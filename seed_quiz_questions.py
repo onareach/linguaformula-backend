@@ -4,7 +4,7 @@ Seed four quiz questions (one per type) linked to formulas via tbl_formula_quest
 - Multiple-choice: Newton's Second Law (formula_id 2)
 - True/false: Kinetic energy (formula_id 35)
 - Word problem: Potential energy (formula_id 36)
-- Multipart: Mean/Variance/StdDev (formula_id 198 - link to parent; parts ask mean, variance, std dev)
+- Multipart: Discrete mean (formula_id 198); part (a) mean of 2,3,1,4,2; part (b) how mean changes if four more samples taken
 """
 import os
 import sys
@@ -70,7 +70,7 @@ def run():
     cur.execute("INSERT INTO tbl_question_answer (question_id, answer_id, is_correct, display_order) VALUES (%s, %s, true, 1);", (q_wp_id, a_wp))
     cur.execute("INSERT INTO tbl_formula_question (formula_id, question_id, formula_question_is_primary) VALUES (36, %s, true);", (q_wp_id,))
 
-    # 4. Multipart: data 2, 3, 1, 4, 2 → mean = 2.4, variance = 1.04, std ≈ 1.02 (formula_id 198)
+    # 4. Multipart: data 2, 3, 1, 4, 2 → mean 2.4; then how mean changes with four more samples (formula_id 198)
     cur.execute("""
         INSERT INTO tbl_question (question_type, stem, display_order)
         VALUES ('multipart', 'The following data represent the number of errors per 100 lines of code in a sample of 5 files: 2, 3, 1, 4, 2.', 4)
@@ -79,7 +79,7 @@ def run():
     q_mp_parent_id = cur.fetchone()[0]
     cur.execute("INSERT INTO tbl_formula_question (formula_id, question_id, formula_question_is_primary) VALUES (198, %s, true);", (q_mp_parent_id,))
 
-    # Part (a): mean
+    # Part (a): mean (same first question)
     cur.execute("""
         INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order)
         VALUES ('word_problem', 'What is the mean?', %s, 'a', 1)
@@ -90,27 +90,16 @@ def run():
     a_mp_a = cur.fetchone()[0]
     cur.execute("INSERT INTO tbl_question_answer (question_id, answer_id, is_correct, display_order) VALUES (%s, %s, true, 1);", (q_mp_a, a_mp_a))
 
-    # Part (b): variance
+    # Part (b): how would the mean change if four more samples were taken (values 2,2,3,3 → new mean 22/9 ≈ 2.44)
     cur.execute("""
         INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order)
-        VALUES ('word_problem', 'What is the variance?', %s, 'b', 2)
+        VALUES ('word_problem', 'If four more samples were taken with values 2, 2, 3, 3, what would the new mean be? (Round to two decimal places.)', %s, 'b', 2)
         RETURNING question_id;
     """, (q_mp_parent_id,))
     q_mp_b = cur.fetchone()[0]
-    cur.execute("INSERT INTO tbl_answer (answer_text, answer_numeric) VALUES ('1.04', 1.04) RETURNING answer_id;")
+    cur.execute("INSERT INTO tbl_answer (answer_text, answer_numeric) VALUES ('2.44', 2.44) RETURNING answer_id;")
     a_mp_b = cur.fetchone()[0]
     cur.execute("INSERT INTO tbl_question_answer (question_id, answer_id, is_correct, display_order) VALUES (%s, %s, true, 1);", (q_mp_b, a_mp_b))
-
-    # Part (c): standard deviation
-    cur.execute("""
-        INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order)
-        VALUES ('word_problem', 'What is the standard deviation? (Round to two decimal places.)', %s, 'c', 3)
-        RETURNING question_id;
-    """, (q_mp_parent_id,))
-    q_mp_c = cur.fetchone()[0]
-    cur.execute("INSERT INTO tbl_answer (answer_text, answer_numeric) VALUES ('1.02', 1.02) RETURNING answer_id;")
-    a_mp_c = cur.fetchone()[0]
-    cur.execute("INSERT INTO tbl_question_answer (question_id, answer_id, is_correct, display_order) VALUES (%s, %s, true, 1);", (q_mp_c, a_mp_c))
 
     conn.commit()
     cur.close()
