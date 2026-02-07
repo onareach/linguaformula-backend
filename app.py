@@ -4,13 +4,16 @@
 # The Heroku API URL will be configured when deploying
 # The Heroku PostgreSQL login will be: heroku pg:psql -a [app-name]
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, make_response
 from flask_cors import CORS
 import psycopg2
 from update_multipart_mean_question import run as run_multipart_mean_update
 from seed_all_formula_questions import run as run_seed_all_formula_questions
 import os
 import openai
+import jwt
+import bcrypt
+from datetime import datetime, timedelta
 import base64
 from PIL import Image
 import io
@@ -28,16 +31,42 @@ CORS(app, origins=[
     "https://frontend-4y57xooet-david-longs-projects-14094a66.vercel.app",  # Vercel deployment
     "https://frontend-ebv9w8qm1-david-longs-projects-14094a66.vercel.app",  # Vercel deployment
     "https://frontend-mauve-three-67.vercel.app"  # Current Vercel deployment
-])
+], supports_credentials=True)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 # Fallback to local database if DATABASE_URL is not set
 if not DATABASE_URL:
     DATABASE_URL = "postgresql://dev_user:dev123@localhost:5432/linguaformula?sslmode=disable"
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+JWT_SECRET = os.environ.get("JWT_SECRET", "dev-secret-change-in-production")
+AUTH_COOKIE_NAME = "linguaformula_token"
 
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
+
+def _auth_db():
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    return psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+
+def _create_jwt(user_id, email):
+    payload = {"sub": user_id, "email": email, "exp": datetime.utcnow() + timedelta(days=7)}
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def _verify_jwt(token):
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return {"user_id": payload["sub"], "email": payload["email"]}
+    except jwt.InvalidTokenError:
+        return None
+
+def _get_current_user():
+    token = request.cookies.get(AUTH_COOKIE_NAME)
+    return _verify_jwt(token)
+
+def _user_response(user_row):
+    return {"id": user_row[0], "email": user_row[1], "display_name": user_row[2]}
 
 def get_formulas():
     # Use sslmode=require for production (Heroku uses postgres://), disable for local development
@@ -379,6 +408,152 @@ def fetch_formula_questions(formula_id):
     try:
         questions = get_questions_by_formula_id(formula_id)
         return jsonify({"questions": questions})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------------------------------------------------------------------------
+# Auth: register, login, logout, me
+# ---------------------------------------------------------------------------
+
+@app.route('/api/auth/register', methods=['POST'])
+def auth_register():
+    try:
+        data = request.get_json() or {}
+        email = (data.get("email") or "").strip().lower()
+        password = data.get("password") or ""
+        display_name = (data.get("display_name") or "").strip() or None
+        if not email or not password:
+            return jsonify({"error": "Email and password are required"}), 400
+        if len(password) < 8:
+            return jsonify({"error": "Password must be at least 8 characters"}), 400
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, email, display_name FROM tbl_user WHERE email = %s;", (email,))
+        existing = cur.fetchone()
+        if existing:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "An account with this email already exists"}), 409
+        password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        cur.execute(
+            "INSERT INTO tbl_user (email, password_hash, display_name) VALUES (%s, %s, %s) RETURNING user_id, email, display_name;",
+            (email, password_hash, display_name),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        token = _create_jwt(row[0], row[1])
+        resp = make_response(jsonify({"user": _user_response(row)}))
+        resp.set_cookie(
+            AUTH_COOKIE_NAME,
+            token,
+            httponly=True,
+            secure=request.is_secure or not app.debug,
+            samesite="None" if (request.is_secure or not app.debug) else "Lax",
+            max_age=7 * 24 * 3600,
+        )
+        return resp
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/auth/login', methods=['POST'])
+def auth_login():
+    try:
+        data = request.get_json() or {}
+        email = (data.get("email") or "").strip().lower()
+        password = data.get("password") or ""
+        if not email or not password:
+            return jsonify({"error": "Email and password are required"}), 400
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, email, display_name, password_hash FROM tbl_user WHERE email = %s;", (email,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row or not bcrypt.checkpw(password.encode("utf-8"), row[3].encode("utf-8")):
+            return jsonify({"error": "Invalid email or password"}), 401
+        token = _create_jwt(row[0], row[1])
+        resp = make_response(jsonify({"user": _user_response(row)}))
+        resp.set_cookie(
+            AUTH_COOKIE_NAME,
+            token,
+            httponly=True,
+            secure=request.is_secure or not app.debug,
+            samesite="None" if (request.is_secure or not app.debug) else "Lax",
+            max_age=7 * 24 * 3600,
+        )
+        return resp
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/auth/logout', methods=['POST'])
+def auth_logout():
+    resp = make_response(jsonify({"ok": True}))
+    resp.set_cookie(AUTH_COOKIE_NAME, "", httponly=True, max_age=0)
+    return resp
+
+
+@app.route('/api/auth/me', methods=['GET'])
+def auth_me():
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"user": None}), 200
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, email, display_name FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        if not row:
+            return jsonify({"user": None}), 200
+        return jsonify({"user": _user_response(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/auth/me', methods=['PATCH'])
+def auth_me_update():
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        data = request.get_json() or {}
+        conn = _auth_db()
+        cur = conn.cursor()
+        if "new_password" in data and data["new_password"]:
+            new_password = data["new_password"]
+            if len(new_password) < 8:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "New password must be at least 8 characters"}), 400
+            password_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+            cur.execute("UPDATE tbl_user SET password_hash = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;", (password_hash, claims["user_id"]))
+        if "email" in data:
+            email = (data.get("email") or "").strip().lower()
+            if not email:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Email cannot be empty"}), 400
+            cur.execute("SELECT user_id FROM tbl_user WHERE email = %s AND user_id != %s;", (email, claims["user_id"]))
+            if cur.fetchone():
+                cur.close()
+                conn.close()
+                return jsonify({"error": "That email is already in use"}), 409
+            cur.execute("UPDATE tbl_user SET email = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;", (email, claims["user_id"]))
+        if "display_name" in data:
+            display_name = (data.get("display_name") or "").strip() or None
+            cur.execute("UPDATE tbl_user SET display_name = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;", (display_name, claims["user_id"]))
+        cur.execute("SELECT user_id, email, display_name FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"user": _user_response(row)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
