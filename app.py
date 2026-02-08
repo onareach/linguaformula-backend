@@ -452,6 +452,7 @@ def auth_register():
         resp.set_cookie(
             AUTH_COOKIE_NAME,
             token,
+            path="/",
             httponly=True,
             secure=request.is_secure or not app.debug,
             samesite="None" if (request.is_secure or not app.debug) else "Lax",
@@ -483,6 +484,7 @@ def auth_login():
         resp.set_cookie(
             AUTH_COOKIE_NAME,
             token,
+            path="/",
             httponly=True,
             secure=request.is_secure or not app.debug,
             samesite="None" if (request.is_secure or not app.debug) else "Lax",
@@ -496,7 +498,16 @@ def auth_login():
 @app.route('/api/auth/logout', methods=['POST'])
 def auth_logout():
     resp = make_response(jsonify({"ok": True}))
-    resp.set_cookie(AUTH_COOKIE_NAME, "", httponly=True, max_age=0)
+    # Clear cookie with same path/secure/samesite as when set, so the browser actually removes it
+    resp.set_cookie(
+        AUTH_COOKIE_NAME,
+        "",
+        path="/",
+        httponly=True,
+        max_age=0,
+        secure=request.is_secure or not app.debug,
+        samesite="None" if (request.is_secure or not app.debug) else "Lax",
+    )
     return resp
 
 
