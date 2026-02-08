@@ -10,6 +10,9 @@ import psycopg2
 from update_multipart_mean_question import run as run_multipart_mean_update
 from seed_all_formula_questions import run as run_seed_all_formula_questions
 import os
+import json
+import secrets
+import hashlib
 import openai
 import jwt
 import bcrypt
@@ -527,10 +530,17 @@ def auth_me_update():
         cur = conn.cursor()
         if "new_password" in data and data["new_password"]:
             new_password = data["new_password"]
+            current_password = data.get("current_password") or ""
             if len(new_password) < 8:
                 cur.close()
                 conn.close()
                 return jsonify({"error": "New password must be at least 8 characters"}), 400
+            cur.execute("SELECT password_hash FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
+            row_pw = cur.fetchone()
+            if not row_pw or not bcrypt.checkpw(current_password.encode("utf-8"), row_pw[0].encode("utf-8")):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Current password is incorrect"}), 401
             password_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
             cur.execute("UPDATE tbl_user SET password_hash = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;", (password_hash, claims["user_id"]))
         if "email" in data:
@@ -554,6 +564,107 @@ def auth_me_update():
         cur.close()
         conn.close()
         return jsonify({"user": _user_response(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+RESET_EXPIRY_HOURS = 1
+
+
+def _send_password_reset_email(to_email: str, reset_link: str) -> bool:
+    """Send password reset email. Returns True if sent (or skipped in dev). Logs link if no email config."""
+    sendgrid_key = os.environ.get("SENDGRID_API_KEY")
+    if sendgrid_key:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.sendgrid.com/v3/mail/send",
+                data=json.dumps({
+                    "personalizations": [{"to": [{"email": to_email}]}],
+                    "from": {"email": os.environ.get("RESET_EMAIL_FROM", "noreply@example.com"), "name": "Lingua Formula"},
+                    "subject": "Reset your password",
+                    "content": [{"type": "text/plain", "value": f"Use this link to set a new password (valid for {RESET_EXPIRY_HOURS} hour):\n\n{reset_link}\n\nIf you didn't request this, you can ignore this email."}]
+                }).encode(),
+                headers={"Authorization": f"Bearer {sendgrid_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status in (200, 202)
+        except Exception as e:
+            app.logger.warning("SendGrid send failed: %s", e)
+            return False
+    app.logger.info("Password reset link (no SENDGRID_API_KEY): %s", reset_link)
+    return True
+
+
+@app.route('/api/auth/forgot-password', methods=['POST'])
+def auth_forgot_password():
+    try:
+        data = request.get_json() or {}
+        email = (data.get("email") or "").strip().lower()
+        if not email:
+            return jsonify({"error": "Email is required"}), 400
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM tbl_user WHERE email = %s;", (email,))
+        if not cur.fetchone():
+            cur.close()
+            conn.close()
+            return jsonify({"ok": True, "message": "If an account exists with that email, we've sent a reset link."})
+        cur.execute("DELETE FROM tbl_password_reset WHERE email = %s;", (email,))
+        token = secrets.token_urlsafe(32)
+        token_lookup = hashlib.sha256(token.encode()).hexdigest()
+        token_hash = bcrypt.hashpw(token.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        expires_at = datetime.utcnow() + timedelta(hours=RESET_EXPIRY_HOURS)
+        cur.execute(
+            "INSERT INTO tbl_password_reset (email, token_lookup, token_hash, expires_at) VALUES (%s, %s, %s, %s);",
+            (email, token_lookup, token_hash, expires_at),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        reset_link = f"{FRONTEND_URL.rstrip('/')}/reset-password?token={token}"
+        _send_password_reset_email(email, reset_link)
+        return jsonify({"ok": True, "message": "If an account exists with that email, we've sent a reset link."})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/auth/reset-password', methods=['POST'])
+def auth_reset_password():
+    try:
+        data = request.get_json() or {}
+        token = (data.get("token") or "").strip()
+        new_password = data.get("new_password") or ""
+        if not token:
+            return jsonify({"error": "Reset token is required"}), 400
+        if len(new_password) < 8:
+            return jsonify({"error": "New password must be at least 8 characters"}), 400
+        token_lookup = hashlib.sha256(token.encode()).hexdigest()
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, email, token_hash, expires_at FROM tbl_password_reset WHERE token_lookup = %s AND expires_at > %s;",
+            (token_lookup, datetime.utcnow()),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Invalid or expired reset link. Request a new one."}), 400
+        _id, email, stored_hash, _exp = row
+        if not bcrypt.checkpw(token.encode("utf-8"), stored_hash.encode("utf-8")):
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Invalid or expired reset link. Request a new one."}), 400
+        password_hash = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        cur.execute("UPDATE tbl_user SET password_hash = %s, updated_at = CURRENT_TIMESTAMP WHERE email = %s;", (password_hash, email))
+        cur.execute("DELETE FROM tbl_password_reset WHERE id = %s;", (_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"ok": True, "message": "Password has been reset. You can sign in with your new password."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
