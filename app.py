@@ -24,17 +24,20 @@ import pytesseract
 
 app = Flask(__name__)
 
-# Below are the local host and Vercel production URL origins are permitted.
-CORS(app, origins=[
-    "http://localhost:3000",  # Local development (default port)
-    "http://localhost:3001",  # Local development (alternate port)
-    "https://linguaformula.com",  # Production domain
-    "https://www.linguaformula.com",  # Production domain with www
-    "https://linguaformula.vercel.app",  # Deployed Vercel site (if different from custom domain)
-    "https://frontend-4y57xooet-david-longs-projects-14094a66.vercel.app",  # Vercel deployment
-    "https://frontend-ebv9w8qm1-david-longs-projects-14094a66.vercel.app",  # Vercel deployment
-    "https://frontend-mauve-three-67.vercel.app"  # Current Vercel deployment
-], supports_credentials=True)
+# CORS: allowed origins for browser requests (e.g. forgot-password from frontend).
+# Add more via env CORS_ORIGINS (comma-separated, no spaces), e.g. CORS_ORIGINS=https://my-app.vercel.app
+_default_origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://linguaformula.com",
+    "https://www.linguaformula.com",
+    "https://linguaformula.vercel.app",
+    "https://frontend-4y57xooet-david-longs-projects-14094a66.vercel.app",
+    "https://frontend-ebv9w8qm1-david-longs-projects-14094a66.vercel.app",
+    "https://frontend-mauve-three-67.vercel.app",
+]
+_extra_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
+CORS(app, origins=_default_origins + _extra_origins, supports_credentials=True)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 # Fallback to local database if DATABASE_URL is not set
