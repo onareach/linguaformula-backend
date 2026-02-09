@@ -592,10 +592,14 @@ def _send_password_reset_email(to_email: str, reset_link: str) -> bool:
     if sendgrid_key:
         try:
             import urllib.request
+            personalizations = [{"to": [{"email": to_email}]}]
+            bcc = (os.environ.get("SENDGRID_BCC") or "").strip()
+            if bcc:
+                personalizations[0]["bcc"] = [{"email": bcc}]
             req = urllib.request.Request(
                 "https://api.sendgrid.com/v3/mail/send",
                 data=json.dumps({
-                    "personalizations": [{"to": [{"email": to_email}]}],
+                    "personalizations": personalizations,
                     "from": {"email": os.environ.get("RESET_EMAIL_FROM", "noreply@example.com"), "name": "Lingua Formula"},
                     "subject": "Reset your password",
                     "content": [{"type": "text/plain", "value": f"Use this link to set a new password (valid for {RESET_EXPIRY_HOURS} hour):\n\n{reset_link}\n\nIf you didn't request this, you can ignore this email."}]
@@ -625,7 +629,7 @@ def auth_forgot_password():
         if not cur.fetchone():
             cur.close()
             conn.close()
-            return jsonify({"ok": True, "message": "If an account exists with that email, we've sent a reset link."})
+            return jsonify({"ok": True, "sent": False, "message": "That email has not been registered."})
         cur.execute("DELETE FROM tbl_password_reset WHERE email = %s;", (email,))
         token = secrets.token_urlsafe(32)
         token_lookup = hashlib.sha256(token.encode()).hexdigest()
@@ -640,7 +644,7 @@ def auth_forgot_password():
         conn.close()
         reset_link = f"{FRONTEND_URL.rstrip('/')}/reset-password?token={token}"
         _send_password_reset_email(email, reset_link)
-        return jsonify({"ok": True, "message": "If an account exists with that email, we've sent a reset link."})
+        return jsonify({"ok": True, "sent": True, "message": "An email has been sent."})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
