@@ -68,7 +68,12 @@ def _verify_jwt(token):
         return None
 
 def _get_current_user():
+    """Auth from cookie (desktop) or Authorization: Bearer (mobile; cross-origin cookie often not sent)."""
     token = request.cookies.get(AUTH_COOKIE_NAME)
+    if not token and request.headers.get("Authorization"):
+        parts = request.headers.get("Authorization", "").strip().split()
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            token = parts[1]
     return _verify_jwt(token)
 
 def _user_response(user_row):
@@ -451,7 +456,7 @@ def auth_register():
         cur.close()
         conn.close()
         token = _create_jwt(row[0], row[1])
-        resp = make_response(jsonify({"user": _user_response(row)}))
+        resp = make_response(jsonify({"user": _user_response(row), "token": token}))
         resp.set_cookie(
             AUTH_COOKIE_NAME,
             token,
@@ -483,7 +488,7 @@ def auth_login():
         if not row or not bcrypt.checkpw(password.encode("utf-8"), row[3].encode("utf-8")):
             return jsonify({"error": "Invalid email or password"}), 401
         token = _create_jwt(row[0], row[1])
-        resp = make_response(jsonify({"user": _user_response(row)}))
+        resp = make_response(jsonify({"user": _user_response(row), "token": token}))
         resp.set_cookie(
             AUTH_COOKIE_NAME,
             token,
