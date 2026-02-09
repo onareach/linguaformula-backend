@@ -687,6 +687,161 @@ def auth_reset_password():
         return jsonify({"error": str(e)}), 500
 
 
+# ---------- Institutions (auth required) ----------
+@app.route('/api/institutions', methods=['GET'])
+def api_institutions_list():
+    """List all institutions (for dropdown / select). Auth required."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT institution_id, institution_name, institution_handle, country, region FROM tbl_institution ORDER BY institution_name;"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "institutions": [
+                {
+                    "id": r[0],
+                    "institution_name": r[1],
+                    "institution_handle": r[2],
+                    "country": r[3],
+                    "region": r[4],
+                }
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/institutions', methods=['POST'])
+def api_institutions_create():
+    """Create an institution. Auth required."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        data = request.get_json() or {}
+        name = (data.get("institution_name") or "").strip()
+        if not name:
+            return jsonify({"error": "institution_name is required"}), 400
+        handle = (data.get("institution_handle") or "").strip() or None
+        country = (data.get("country") or "").strip() or None
+        region = (data.get("region") or "").strip() or None
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO tbl_institution (institution_name, institution_handle, country, region) VALUES (%s, %s, %s, %s) RETURNING institution_id, institution_name, institution_handle, country, region;",
+            (name, handle, country, region),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "institution": {
+                "id": row[0],
+                "institution_name": row[1],
+                "institution_handle": row[2],
+                "country": row[3],
+                "region": row[4],
+            }
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ---------- Courses (auth required) ----------
+@app.route('/api/courses', methods=['GET'])
+def api_courses_list():
+    """List courses the current user is enrolled in (with institution name). Auth required."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT c.course_id, c.course_name, c.course_code, c.institution_id, c.course_type,
+                   i.institution_name
+            FROM tbl_user_course uc
+            JOIN tbl_course c ON c.course_id = uc.course_id
+            LEFT JOIN tbl_institution i ON i.institution_id = c.institution_id
+            WHERE uc.user_id = %s
+            ORDER BY c.course_name;
+        """, (user_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "courses": [
+                {
+                    "course_id": r[0],
+                    "course_name": r[1],
+                    "course_code": r[2],
+                    "institution_id": r[3],
+                    "course_type": r[4],
+                    "institution_name": r[5],
+                }
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses', methods=['POST'])
+def api_courses_create():
+    """Create a course and enroll the current user. Auth required."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        data = request.get_json() or {}
+        course_name = (data.get("course_name") or "").strip()
+        if not course_name:
+            return jsonify({"error": "course_name is required"}), 400
+        course_code = (data.get("course_code") or "").strip() or None
+        institution_id = data.get("institution_id")  # can be null for personal
+        if institution_id is not None:
+            institution_id = int(institution_id)
+        course_type = (data.get("course_type") or "").strip() or None
+        if not course_type and institution_id is None:
+            course_type = "personal"
+        elif not course_type:
+            course_type = "academic"
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO tbl_course (course_name, course_code, institution_id, course_type) VALUES (%s, %s, %s, %s) RETURNING course_id, course_name, course_code, institution_id, course_type;",
+            (course_name, course_code, institution_id, course_type),
+        )
+        row = cur.fetchone()
+        course_id = row[0]
+        cur.execute("INSERT INTO tbl_user_course (user_id, course_id) VALUES (%s, %s) ON CONFLICT (user_id, course_id) DO NOTHING;", (user_id, course_id))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "course": {
+                "course_id": course_id,
+                "course_name": row[1],
+                "course_code": row[2],
+                "institution_id": row[3],
+                "course_type": row[4],
+            }
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/admin/update-multipart-mean', methods=['GET'])
 def admin_update_multipart_mean():
     """One-off: run the multipart mean question update and return result (no heroku run timeout)."""
