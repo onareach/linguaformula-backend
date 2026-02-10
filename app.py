@@ -847,6 +847,128 @@ def api_courses_create():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/courses/formulas', methods=['GET'])
+def api_all_course_formulas_list():
+    """List all course-formula links for the current user (all courses). Auth required."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT c.course_id, c.course_name, c.course_code, ucf.formula_id, f.formula_name, f.latex,
+                   ucf.segment_type, ucf.segment_label
+            FROM tbl_user_course_formula ucf
+            JOIN tbl_course c ON c.course_id = ucf.course_id
+            JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+            WHERE ucf.user_id = %s
+            ORDER BY c.course_name, ucf.segment_type NULLS LAST, ucf.segment_label NULLS LAST, f.formula_name;
+        """, (user_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "items": [
+                {
+                    "course_id": r[0],
+                    "course_name": r[1],
+                    "course_code": r[2],
+                    "formula_id": r[3],
+                    "formula_name": r[4],
+                    "latex": r[5],
+                    "segment_type": r[6],
+                    "segment_label": r[7],
+                }
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/formulas', methods=['GET'])
+def api_course_formulas_list(course_id):
+    """List formulas linked to this course for the current user. Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT uc.user_id FROM tbl_user_course uc WHERE uc.user_id = %s AND uc.course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("""
+            SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order, ucf.segment_type, ucf.segment_label
+            FROM tbl_user_course_formula ucf
+            JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+            WHERE ucf.user_id = %s AND ucf.course_id = %s
+            ORDER BY ucf.display_order NULLS LAST, f.formula_name;
+        """, (user_id, course_id))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "formulas": [
+                {"id": r[0], "formula_name": r[1], "latex": r[2], "display_order": r[3], "segment_type": r[4], "segment_label": r[5]}
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/formulas/<int:formula_id>', methods=['POST'])
+def api_course_formula_add(course_id, formula_id):
+    """Add a formula to a course for the current user. Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("""
+            SELECT 1 FROM tbl_formula WHERE formula_id = %s;
+        """, (formula_id,))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Formula not found"}), 404
+        data = request.get_json() or {}
+        segment_type = (data.get("segment_type") or "").strip() or None
+        if segment_type and segment_type not in ("chapter", "module", "examination"):
+            segment_type = None
+        segment_label = (data.get("segment_label") or "").strip() or None
+        cur.execute("""
+            INSERT INTO tbl_user_course_formula (user_id, course_id, formula_id, segment_type, segment_label)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, course_id, formula_id) DO UPDATE SET
+                segment_type = EXCLUDED.segment_type,
+                segment_label = EXCLUDED.segment_label;
+        """, (user_id, course_id, formula_id, segment_type, segment_label))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"message": "Formula added to course"}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/admin/update-multipart-mean', methods=['GET'])
 def admin_update_multipart_mean():
     """One-off: run the multipart mean question update and return result (no heroku run timeout)."""
