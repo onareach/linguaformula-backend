@@ -1052,6 +1052,76 @@ def api_course_formula_add(course_id, formula_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/courses/<int:course_id>/formulas/<int:formula_id>', methods=['PATCH'])
+def api_course_formula_update(course_id, formula_id):
+    """Update segment_type and segment_label for a course-formula link. Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        data = request.get_json() or {}
+        segment_type = (data.get("segment_type") or "").strip() or None
+        if segment_type and segment_type not in ("chapter", "module", "examination"):
+            segment_type = None
+        segment_label = (data.get("segment_label") or "").strip() or None
+        cur.execute("""
+            UPDATE tbl_user_course_formula
+            SET segment_type = %s, segment_label = %s
+            WHERE user_id = %s AND course_id = %s AND formula_id = %s;
+        """, (segment_type, segment_label, user_id, course_id, formula_id))
+        conn.commit()
+        updated = cur.rowcount
+        cur.close()
+        conn.close()
+        if updated == 0:
+            return jsonify({"error": "Formula not linked to this course"}), 404
+        return jsonify({"message": "Segment updated"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/formulas/<int:formula_id>', methods=['DELETE'])
+def api_course_formula_remove(course_id, formula_id):
+    """Remove a formula from a course for the current user. Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("""
+            DELETE FROM tbl_user_course_formula
+            WHERE user_id = %s AND course_id = %s AND formula_id = %s;
+        """, (user_id, course_id, formula_id))
+        conn.commit()
+        deleted = cur.rowcount
+        cur.close()
+        conn.close()
+        if deleted == 0:
+            return jsonify({"error": "Formula not linked to this course"}), 404
+        return jsonify({"message": "Formula removed from course"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/admin/update-multipart-mean', methods=['GET'])
 def admin_update_multipart_mean():
     """One-off: run the multipart mean question update and return result (no heroku run timeout)."""
