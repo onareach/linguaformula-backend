@@ -847,6 +847,83 @@ def api_courses_create():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/courses/<int:course_id>', methods=['PATCH'])
+def api_course_update(course_id):
+    """Update a course the current user is enrolled in. Auth required."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;", (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        data = request.get_json() or {}
+        course_name = (data.get("course_name") or "").strip()
+        course_code = (data.get("course_code") or "").strip() or None
+        institution_id = data.get("institution_id")
+        if institution_id is not None:
+            institution_id = int(institution_id)
+        if not course_name:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "course_name is required"}), 400
+        cur.execute(
+            """UPDATE tbl_course SET course_name = %s, course_code = %s, institution_id = %s, updated_at = CURRENT_TIMESTAMP
+               WHERE course_id = %s RETURNING course_id, course_name, course_code, institution_id, course_type;""",
+            (course_name, course_code, institution_id, course_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if not row:
+            return jsonify({"error": "Course not found"}), 404
+        return jsonify({
+            "course": {
+                "course_id": row[0],
+                "course_name": row[1],
+                "course_code": row[2],
+                "institution_id": row[3],
+                "course_type": row[4],
+            }
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>', methods=['DELETE'])
+def api_course_delete(course_id):
+    """Remove current user's enrollment and their course-formula links. If no other enrollments, delete the course. Auth required."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;", (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("DELETE FROM tbl_user_course_formula WHERE user_id = %s AND course_id = %s;", (user_id, course_id))
+        cur.execute("DELETE FROM tbl_user_course WHERE user_id = %s AND course_id = %s;", (user_id, course_id))
+        cur.execute("SELECT 1 FROM tbl_user_course WHERE course_id = %s;", (course_id,))
+        if cur.fetchone() is None:
+            cur.execute("DELETE FROM tbl_course WHERE course_id = %s;", (course_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"message": "Course removed"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/courses/formulas', methods=['GET'])
 def api_all_course_formulas_list():
     """List all course-formula links for the current user (all courses). Auth required."""
