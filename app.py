@@ -37,7 +37,13 @@ _default_origins = [
     "https://frontend-mauve-three-67.vercel.app",
 ]
 _extra_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", "").split(",") if o.strip()]
-CORS(app, origins=_default_origins + _extra_origins, supports_credentials=True)
+CORS(
+    app,
+    origins=_default_origins + _extra_origins,
+    supports_credentials=True,
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+)
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 # Fallback to local database if DATABASE_URL is not set
