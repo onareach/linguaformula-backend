@@ -1,4 +1,5 @@
 # app.py
+# Lingua Formula API backend
 # This app.py was created in order to expose an API endpoint for
 # Vercel Next.js to call
 # The Heroku API URL will be configured when deploying
