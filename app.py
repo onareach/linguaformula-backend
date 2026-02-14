@@ -971,6 +971,56 @@ def api_all_course_formulas_list():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/courses/<int:course_id>/questions', methods=['GET'])
+def api_course_questions(course_id):
+    """Get all quiz questions for formulas linked to this course for the current user. Auth required; user must be enrolled.
+    Query params: segment_type (chapter|module|examination), segment_label (optional filter)."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        segment_type = request.args.get("segment_type", "").strip() or None
+        if segment_type and segment_type not in ("chapter", "module", "examination"):
+            segment_type = None
+        segment_label = request.args.get("segment_label", "").strip() or None
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT c.course_name, c.course_code FROM tbl_user_course uc
+            JOIN tbl_course c ON c.course_id = uc.course_id
+            WHERE uc.user_id = %s AND uc.course_id = %s;
+        """, (user_id, course_id))
+        row = cur.fetchone()
+        if row is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        course_name, course_code = row
+        cur.execute("""
+            SELECT ucf.formula_id FROM tbl_user_course_formula ucf
+            WHERE ucf.user_id = %s AND ucf.course_id = %s
+            AND (%s::text IS NULL OR ucf.segment_type = %s)
+            AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s));
+        """, (user_id, course_id, segment_type, segment_type, segment_label, segment_label))
+        formula_ids = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        all_questions = []
+        for fid in formula_ids:
+            qs = get_questions_by_formula_id(fid)
+            for q in qs:
+                q["formula_id"] = fid
+                all_questions.append(q)
+        return jsonify({
+            "course_name": course_name,
+            "course_code": course_code,
+            "questions": all_questions,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/courses/<int:course_id>/formulas', methods=['GET'])
 def api_course_formulas_list(course_id):
     """List formulas linked to this course for the current user. Auth required; user must be enrolled."""
