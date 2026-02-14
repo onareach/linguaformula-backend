@@ -303,7 +303,9 @@ def fetch_disciplines():
         conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
         cursor = conn.cursor()
         
-        # Fetch all disciplines with parent info and formula counts
+        # Fetch all disciplines with parent info and formula counts.
+        # For each discipline, formula_count = distinct formulas in that discipline's subtree
+        # (the discipline itself + all descendants), so parents show the total for their category.
         cursor.execute("""
             SELECT 
                 d.discipline_id,
@@ -313,7 +315,18 @@ def fetch_disciplines():
                 d.discipline_parent_id,
                 COALESCE(p.discipline_name, NULL) as parent_name,
                 COALESCE(p.discipline_handle, NULL) as parent_handle,
-                (SELECT COUNT(*) FROM tbl_formula_discipline WHERE discipline_id = d.discipline_id) as formula_count
+                (SELECT COUNT(DISTINCT fd.formula_id)
+                 FROM tbl_formula_discipline fd
+                 WHERE fd.discipline_id IN (
+                   WITH RECURSIVE subtree AS (
+                     SELECT discipline_id FROM tbl_discipline WHERE discipline_id = d.discipline_id
+                     UNION ALL
+                     SELECT child.discipline_id FROM tbl_discipline child
+                     INNER JOIN subtree s ON child.discipline_parent_id = s.discipline_id
+                   )
+                   SELECT discipline_id FROM subtree
+                 )
+                ) as formula_count
             FROM tbl_discipline d
             LEFT JOIN tbl_discipline p ON d.discipline_parent_id = p.discipline_id
             ORDER BY COALESCE(d.discipline_parent_id, 0), d.discipline_name;
