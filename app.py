@@ -304,9 +304,8 @@ def fetch_disciplines():
         conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
         cursor = conn.cursor()
         
-        # Fetch all disciplines with parent info and formula counts.
-        # For each discipline, formula_count = distinct formulas in that discipline's subtree
-        # (the discipline itself + all descendants), so parents show the total for their category.
+        # Fetch all disciplines with parent info, formula counts, and term counts.
+        # formula_count and term_count = distinct items in that discipline's subtree.
         cursor.execute("""
             SELECT 
                 d.discipline_id,
@@ -327,7 +326,19 @@ def fetch_disciplines():
                    )
                    SELECT discipline_id FROM subtree
                  )
-                ) as formula_count
+                ) as formula_count,
+                (SELECT COUNT(DISTINCT td.term_id)
+                 FROM tbl_term_discipline td
+                 WHERE td.discipline_id IN (
+                   WITH RECURSIVE subtree AS (
+                     SELECT discipline_id FROM tbl_discipline WHERE discipline_id = d.discipline_id
+                     UNION ALL
+                     SELECT child.discipline_id FROM tbl_discipline child
+                     INNER JOIN subtree s ON child.discipline_parent_id = s.discipline_id
+                   )
+                   SELECT discipline_id FROM subtree
+                 )
+                ) as term_count
             FROM tbl_discipline d
             LEFT JOIN tbl_discipline p ON d.discipline_parent_id = p.discipline_id
             ORDER BY COALESCE(d.discipline_parent_id, 0), d.discipline_name;
@@ -344,7 +355,8 @@ def fetch_disciplines():
                 "parent_id": row[4],
                 "parent_name": row[5],
                 "parent_handle": row[6],
-                "formula_count": row[7]
+                "formula_count": row[7],
+                "term_count": row[8] if len(row) > 8 else 0
             })
         
         cursor.close()
@@ -352,6 +364,162 @@ def fetch_disciplines():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+def get_terms():
+    """Get all terms."""
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT term_id, term_name, definition, display_order
+        FROM tbl_term
+        ORDER BY COALESCE(display_order, 999), term_name;
+    """)
+    terms = cursor.fetchall()
+    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3]} for row in terms]
+    cursor.close()
+    conn.close()
+    return result
+
+
+def get_terms_by_disciplines(discipline_ids, include_children=True):
+    """Get terms filtered by discipline IDs, optionally including child disciplines."""
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    if include_children:
+        cursor.execute("""
+            WITH RECURSIVE discipline_tree AS (
+                SELECT discipline_id FROM tbl_discipline WHERE discipline_id = ANY(%s)
+                UNION ALL
+                SELECT d.discipline_id
+                FROM tbl_discipline d
+                INNER JOIN discipline_tree dt ON d.discipline_parent_id = dt.discipline_id
+            )
+            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.display_order
+            FROM tbl_term t
+            INNER JOIN tbl_term_discipline td ON t.term_id = td.term_id
+            INNER JOIN discipline_tree dt ON td.discipline_id = dt.discipline_id
+            ORDER BY t.display_order, t.term_name;
+        """, (discipline_ids,))
+    else:
+        cursor.execute("""
+            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.display_order
+            FROM tbl_term t
+            INNER JOIN tbl_term_discipline td ON t.term_id = td.term_id
+            WHERE td.discipline_id = ANY(%s)
+            ORDER BY t.display_order, t.term_name;
+        """, (discipline_ids,))
+    terms = cursor.fetchall()
+    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3]} for row in terms]
+    cursor.close()
+    conn.close()
+    return result
+
+
+def get_term_by_id(term_id):
+    """Get a single term by ID."""
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT term_id, term_name, definition, display_order
+        FROM tbl_term
+        WHERE term_id = %s;
+    """, (term_id,))
+    row = cursor.fetchone()
+    cursor.close()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3]}
+
+
+def get_questions_by_term_id(term_id):
+    """Get all quiz questions linked to a term (top-level only). Same structure as get_questions_by_formula_id."""
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT q.question_id, q.question_type, q.stem, q.explanation, q.display_order
+        FROM tbl_question q
+        INNER JOIN tbl_term_question tq ON tq.question_id = q.question_id
+        WHERE tq.term_id = %s AND q.parent_question_id IS NULL
+        ORDER BY q.display_order, q.question_id;
+    """, (term_id,))
+    rows = cursor.fetchall()
+    result = []
+    for r in rows:
+        qid, qtype, stem, explanation, display_order = r
+        cursor.execute("""
+            SELECT a.answer_id, a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+            FROM tbl_question_answer qa
+            INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+            WHERE qa.question_id = %s
+            ORDER BY qa.display_order, qa.question_answer_id;
+        """, (qid,))
+        answers = [{"answer_id": row[0], "answer_text": row[1], "answer_numeric": float(row[2]) if row[2] is not None else None, "is_correct": row[3], "display_order": row[4]} for row in cursor.fetchall()]
+        item = {"question_id": qid, "question_type": qtype, "stem": stem, "explanation": explanation, "display_order": display_order, "answers": answers}
+        if qtype == "multipart":
+            cursor.execute("""
+                SELECT question_id, part_label, stem, display_order
+                FROM tbl_question
+                WHERE parent_question_id = %s
+                ORDER BY display_order, question_id;
+            """, (qid,))
+            parts = []
+            for pr in cursor.fetchall():
+                pid, plabel, pstem, pord = pr
+                cursor.execute("""
+                    SELECT a.answer_id, a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+                    FROM tbl_question_answer qa
+                    INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+                    WHERE qa.question_id = %s
+                    ORDER BY qa.display_order;
+                """, (pid,))
+                part_answers = [{"answer_id": row[0], "answer_text": row[1], "answer_numeric": float(row[2]) if row[2] is not None else None, "is_correct": row[3], "display_order": row[4]} for row in cursor.fetchall()]
+                parts.append({"question_id": pid, "part_label": plabel, "stem": pstem, "display_order": pord, "answers": part_answers})
+            item["parts"] = parts
+        result.append(item)
+    cursor.close()
+    conn.close()
+    return result
+
+
+# Route to fetch all terms (with optional discipline filtering)
+@app.route('/api/terms', methods=['GET'])
+def fetch_terms():
+    try:
+        discipline_ids = request.args.getlist('discipline_id', type=int)
+        include_children = request.args.get('include_children', 'true').lower() == 'true'
+        if discipline_ids:
+            terms = get_terms_by_disciplines(discipline_ids, include_children)
+        else:
+            terms = get_terms()
+        return jsonify(terms)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/terms/<int:term_id>', methods=['GET'])
+def fetch_term_by_id(term_id):
+    try:
+        term = get_term_by_id(term_id)
+        if term:
+            return jsonify(term)
+        return jsonify({"error": "Term not found"}), 404
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/terms/<int:term_id>/questions', methods=['GET'])
+def fetch_term_questions(term_id):
+    try:
+        questions = get_questions_by_term_id(term_id)
+        return jsonify({"questions": questions})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 # Route to fetch all formulas (with optional discipline filtering)
 @app.route('/api/formulas', methods=['GET'])
