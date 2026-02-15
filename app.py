@@ -84,7 +84,25 @@ def _get_current_user():
     return _verify_jwt(token)
 
 def _user_response(user_row):
-    return {"id": user_row[0], "email": user_row[1], "display_name": user_row[2]}
+    # user_row: (user_id, email, display_name, is_admin)
+    is_admin = user_row[3] if len(user_row) > 3 else False
+    return {"id": user_row[0], "email": user_row[1], "display_name": user_row[2], "is_admin": is_admin}
+
+
+def _require_admin():
+    """Require authenticated admin. Returns (claims, None) or (None, response_tuple)."""
+    claims = _get_current_user()
+    if not claims:
+        return None, (jsonify({"error": "Not authenticated"}), 401)
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("SELECT is_admin FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    if not row or not row[0]:
+        return None, (jsonify({"error": "Admin access required"}), 403)
+    return claims, None
 
 def get_formulas():
     # Use sslmode=require for production (Heroku uses postgres://), disable for local development
@@ -644,7 +662,7 @@ def auth_register():
         cur.close()
         conn.close()
         token = _create_jwt(row[0], row[1])
-        resp = make_response(jsonify({"user": _user_response(row), "token": token}))
+        resp = make_response(jsonify({"user": _user_response((row[0], row[1], row[2], False)), "token": token}))
         resp.set_cookie(
             AUTH_COOKIE_NAME,
             token,
@@ -669,14 +687,14 @@ def auth_login():
             return jsonify({"error": "Email and password are required"}), 400
         conn = _auth_db()
         cur = conn.cursor()
-        cur.execute("SELECT user_id, email, display_name, password_hash FROM tbl_user WHERE email = %s;", (email,))
+        cur.execute("SELECT user_id, email, display_name, password_hash, COALESCE(is_admin, false) FROM tbl_user WHERE email = %s;", (email,))
         row = cur.fetchone()
         cur.close()
         conn.close()
         if not row or not bcrypt.checkpw(password.encode("utf-8"), row[3].encode("utf-8")):
             return jsonify({"error": "Invalid email or password"}), 401
         token = _create_jwt(row[0], row[1])
-        resp = make_response(jsonify({"user": _user_response(row), "token": token}))
+        resp = make_response(jsonify({"user": _user_response((row[0], row[1], row[2], row[4])), "token": token}))
         resp.set_cookie(
             AUTH_COOKIE_NAME,
             token,
@@ -715,7 +733,7 @@ def auth_me():
             return jsonify({"user": None}), 200
         conn = _auth_db()
         cur = conn.cursor()
-        cur.execute("SELECT user_id, email, display_name FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
+        cur.execute("SELECT user_id, email, display_name, COALESCE(is_admin, false) FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
         row = cur.fetchone()
         cur.close()
         conn.close()
@@ -765,11 +783,72 @@ def auth_me_update():
         if "display_name" in data:
             display_name = (data.get("display_name") or "").strip() or None
             cur.execute("UPDATE tbl_user SET display_name = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s;", (display_name, claims["user_id"]))
-        cur.execute("SELECT user_id, email, display_name FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
+        cur.execute("SELECT user_id, email, display_name, COALESCE(is_admin, false) FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
         row = cur.fetchone()
         conn.commit()
         cur.close()
         conn.close()
+        return jsonify({"user": _user_response(row)})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/admin/users', methods=['GET'])
+def admin_list_users():
+    """List all users (admin only). Returns id, email, display_name, is_admin."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT user_id, email, display_name, COALESCE(is_admin, false) FROM tbl_user ORDER BY email;"
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        users = [_user_response(r) for r in rows]
+        return jsonify({"users": users})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/admin/users/<int:target_user_id>', methods=['PATCH'])
+def admin_update_user(target_user_id):
+    """Update a user's is_admin flag (admin only). Cannot revoke own admin when sole admin."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    is_admin = data.get("is_admin")
+    if is_admin is None:
+        return jsonify({"error": "is_admin is required"}), 400
+    is_admin = bool(is_admin)
+
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+
+        # If revoking own admin, ensure at least one other admin remains
+        if not is_admin and target_user_id == claims["user_id"]:
+            cur.execute("SELECT COUNT(*) FROM tbl_user WHERE is_admin = true;")
+            admin_count = cur.fetchone()[0]
+            if admin_count <= 1:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Cannot revoke your own admin rights when you are the only admin."}), 400
+
+        cur.execute(
+            "UPDATE tbl_user SET is_admin = %s, updated_at = CURRENT_TIMESTAMP WHERE user_id = %s RETURNING user_id, email, display_name, is_admin;",
+            (is_admin, target_user_id),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        if not row:
+            return jsonify({"error": "User not found"}), 404
         return jsonify({"user": _user_response(row)})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
