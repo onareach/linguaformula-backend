@@ -1179,6 +1179,7 @@ def api_course_delete(course_id):
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
         cur.execute("DELETE FROM tbl_user_course_formula WHERE user_id = %s AND course_id = %s;", (user_id, course_id))
+        cur.execute("DELETE FROM tbl_user_course_term WHERE user_id = %s AND course_id = %s;", (user_id, course_id))
         cur.execute("DELETE FROM tbl_user_course WHERE user_id = %s AND course_id = %s;", (user_id, course_id))
         cur.execute("SELECT 1 FROM tbl_user_course WHERE course_id = %s;", (course_id,))
         if cur.fetchone() is None:
@@ -1429,6 +1430,248 @@ def api_course_formula_remove(course_id, formula_id):
         if deleted == 0:
             return jsonify({"error": "Formula not linked to this course"}), 404
         return jsonify({"message": "Formula removed from course"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/terms', methods=['GET'])
+def api_all_course_terms_list():
+    """List all course-term links for the current user (all courses). Auth required."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT c.course_id, c.course_name, c.course_code, uct.term_id, t.term_name, t.definition,
+                   uct.segment_type, uct.segment_label
+            FROM tbl_user_course_term uct
+            JOIN tbl_course c ON c.course_id = uct.course_id
+            JOIN tbl_term t ON t.term_id = uct.term_id
+            WHERE uct.user_id = %s
+            ORDER BY c.course_name, uct.segment_type NULLS LAST, uct.segment_label NULLS LAST, t.term_name;
+        """, (user_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "items": [
+                {
+                    "course_id": r[0],
+                    "course_name": r[1],
+                    "course_code": r[2],
+                    "term_id": r[3],
+                    "term_name": r[4],
+                    "definition": r[5],
+                    "segment_type": r[6],
+                    "segment_label": r[7],
+                }
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/terms', methods=['GET'])
+def api_course_terms_list(course_id):
+    """List terms linked to this course for the current user. Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT uc.user_id FROM tbl_user_course uc WHERE uc.user_id = %s AND uc.course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("""
+            SELECT t.term_id, t.term_name, t.definition, uct.display_order, uct.segment_type, uct.segment_label
+            FROM tbl_user_course_term uct
+            JOIN tbl_term t ON t.term_id = uct.term_id
+            WHERE uct.user_id = %s AND uct.course_id = %s
+            ORDER BY uct.display_order NULLS LAST, t.term_name;
+        """, (user_id, course_id))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "terms": [
+                {"term_id": r[0], "term_name": r[1], "definition": r[2], "display_order": r[3], "segment_type": r[4], "segment_label": r[5]}
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/terms/<int:term_id>', methods=['POST'])
+def api_course_term_add(course_id, term_id):
+    """Add a term to a course for the current user. Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("""
+            SELECT 1 FROM tbl_term WHERE term_id = %s;
+        """, (term_id,))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Term not found"}), 404
+        data = request.get_json() or {}
+        segment_type = (data.get("segment_type") or "").strip() or None
+        if segment_type and segment_type not in ("chapter", "module", "examination"):
+            segment_type = None
+        segment_label = (data.get("segment_label") or "").strip() or None
+        cur.execute("""
+            INSERT INTO tbl_user_course_term (user_id, course_id, term_id, segment_type, segment_label)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (user_id, course_id, term_id) DO UPDATE SET
+                segment_type = EXCLUDED.segment_type,
+                segment_label = EXCLUDED.segment_label;
+        """, (user_id, course_id, term_id, segment_type, segment_label))
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"message": "Term added to course"}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/terms/<int:term_id>', methods=['PATCH'])
+def api_course_term_update(course_id, term_id):
+    """Update segment_type and segment_label for a course-term link. Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        data = request.get_json() or {}
+        segment_type = (data.get("segment_type") or "").strip() or None
+        if segment_type and segment_type not in ("chapter", "module", "examination"):
+            segment_type = None
+        segment_label = (data.get("segment_label") or "").strip() or None
+        cur.execute("""
+            UPDATE tbl_user_course_term
+            SET segment_type = %s, segment_label = %s
+            WHERE user_id = %s AND course_id = %s AND term_id = %s;
+        """, (segment_type, segment_label, user_id, course_id, term_id))
+        conn.commit()
+        updated = cur.rowcount
+        cur.close()
+        conn.close()
+        if updated == 0:
+            return jsonify({"error": "Term not linked to this course"}), 404
+        return jsonify({"message": "Segment updated"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/terms/<int:term_id>', methods=['DELETE'])
+def api_course_term_remove(course_id, term_id):
+    """Remove a term from a course for the current user. Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("""
+            DELETE FROM tbl_user_course_term
+            WHERE user_id = %s AND course_id = %s AND term_id = %s;
+        """, (user_id, course_id, term_id))
+        conn.commit()
+        deleted = cur.rowcount
+        cur.close()
+        conn.close()
+        if deleted == 0:
+            return jsonify({"error": "Term not linked to this course"}), 404
+        return jsonify({"message": "Term removed from course"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/term-questions', methods=['GET'])
+def api_course_term_questions(course_id):
+    """Get all quiz questions for terms linked to this course for the current user. Auth required; user must be enrolled.
+    Query params: segment_type (chapter|module|examination), segment_label (optional filter)."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        segment_type = request.args.get("segment_type", "").strip() or None
+        if segment_type and segment_type not in ("chapter", "module", "examination"):
+            segment_type = None
+        segment_label = request.args.get("segment_label", "").strip() or None
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT c.course_name, c.course_code FROM tbl_user_course uc
+            JOIN tbl_course c ON c.course_id = uc.course_id
+            WHERE uc.user_id = %s AND uc.course_id = %s;
+        """, (user_id, course_id))
+        row = cur.fetchone()
+        if row is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        course_name, course_code = row
+        cur.execute("""
+            SELECT uct.term_id FROM tbl_user_course_term uct
+            WHERE uct.user_id = %s AND uct.course_id = %s
+            AND (%s::text IS NULL OR uct.segment_type = %s)
+            AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s));
+        """, (user_id, course_id, segment_type, segment_type, segment_label, segment_label))
+        term_ids = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        all_questions = []
+        for tid in term_ids:
+            qs = get_questions_by_term_id(tid)
+            for q in qs:
+                q["term_id"] = tid
+                all_questions.append(q)
+        return jsonify({
+            "course_name": course_name,
+            "course_code": course_code,
+            "questions": all_questions,
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
