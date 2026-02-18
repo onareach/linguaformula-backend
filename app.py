@@ -614,6 +614,262 @@ def api_term_update(term_id):
     return jsonify(term), 200
 
 
+# ---------------------------------------------------------------------------
+# Constants and Units (setup / admin)
+# ---------------------------------------------------------------------------
+
+def _get_constants():
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT constant_id, constant_name, symbol, value_text, description, display_order
+        FROM tbl_constant ORDER BY constant_name;
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"id": r[0], "constant_name": r[1], "symbol": r[2], "value_text": r[3], "description": r[4], "display_order": r[5]} for r in rows]
+
+
+def _get_units():
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT unit_id, unit_name, symbol, unit_system, description, display_order
+        FROM tbl_unit ORDER BY unit_name;
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return [{"id": r[0], "unit_name": r[1], "symbol": r[2], "unit_system": r[3], "description": r[4], "display_order": r[5]} for r in rows]
+
+
+@app.route('/api/constants', methods=['GET'])
+def fetch_constants():
+    try:
+        constants = _get_constants()
+        return jsonify(constants)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/constants', methods=['POST'])
+def api_constant_create():
+    """Create a constant (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    name = (data.get("constant_name") or "").strip()
+    if not name:
+        return jsonify({"error": "constant_name is required"}), 400
+    symbol = (data.get("symbol") or "").strip() or None
+    value_text = (data.get("value_text") or "").strip() or None
+    description = (data.get("description") or "").strip() or None
+    display_order = data.get("display_order")
+    if display_order is not None and display_order != "":
+        try:
+            display_order = int(display_order)
+        except (TypeError, ValueError):
+            display_order = None
+    else:
+        display_order = None
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tbl_constant (constant_name, symbol, value_text, description, display_order)
+        VALUES (%s, %s, %s, %s, %s) RETURNING constant_id;
+    """, (name, symbol, value_text, description, display_order))
+    cid = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    constants = _get_constants()
+    obj = next((c for c in constants if c["id"] == cid), None)
+    return jsonify(obj or {"id": cid, "constant_name": name, "symbol": symbol, "value_text": value_text, "description": description, "display_order": display_order}), 201
+
+
+@app.route('/api/constants/<int:constant_id>', methods=['PATCH'])
+def api_constant_update(constant_id):
+    """Update a constant (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    updates = {}
+    if "constant_name" in data:
+        s = (str(data["constant_name"]) or "").strip()
+        if not s:
+            return jsonify({"error": "constant_name cannot be empty"}), 400
+        updates["constant_name"] = s
+    if "symbol" in data:
+        updates["symbol"] = (str(data["symbol"]) or "").strip() or None
+    if "value_text" in data:
+        updates["value_text"] = (str(data["value_text"]) or "").strip() or None
+    if "description" in data:
+        updates["description"] = (str(data["description"]) or "").strip() or None
+    if "display_order" in data:
+        v = data["display_order"]
+        updates["display_order"] = int(v) if v is not None and v != "" else None
+    if not updates:
+        return jsonify({"error": "No valid fields to update"}), 400
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM tbl_constant WHERE constant_id = %s;", (constant_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Constant not found"}), 404
+    set_clause = ", ".join(f"{k} = %s" for k in updates) + ", updated_at = CURRENT_TIMESTAMP"
+    vals = [updates[k] for k in updates]
+    cur.execute(f"UPDATE tbl_constant SET {set_clause} WHERE constant_id = %s;", vals + [constant_id])
+    conn.commit()
+    cur.close()
+    conn.close()
+    constants = _get_constants()
+    obj = next((c for c in constants if c["id"] == constant_id), None)
+    return jsonify(obj), 200
+
+
+@app.route('/api/constants/<int:constant_id>', methods=['DELETE'])
+def api_constant_delete(constant_id):
+    """Delete a constant (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tbl_constant WHERE constant_id = %s RETURNING constant_id;", (constant_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted == 0:
+        return jsonify({"error": "Constant not found"}), 404
+    return jsonify({"message": "Constant deleted"}), 200
+
+
+@app.route('/api/units', methods=['GET'])
+def fetch_units():
+    try:
+        units = _get_units()
+        return jsonify(units)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/units', methods=['POST'])
+def api_unit_create():
+    """Create a unit (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    name = (data.get("unit_name") or "").strip()
+    if not name:
+        return jsonify({"error": "unit_name is required"}), 400
+    symbol = (data.get("symbol") or "").strip() or None
+    unit_system = (data.get("unit_system") or "").strip() or None
+    description = (data.get("description") or "").strip() or None
+    display_order = data.get("display_order")
+    if display_order is not None and display_order != "":
+        try:
+            display_order = int(display_order)
+        except (TypeError, ValueError):
+            display_order = None
+    else:
+        display_order = None
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO tbl_unit (unit_name, symbol, unit_system, description, display_order)
+        VALUES (%s, %s, %s, %s, %s) RETURNING unit_id;
+    """, (name, symbol, unit_system, description, display_order))
+    uid = cur.fetchone()[0]
+    conn.commit()
+    cur.close()
+    conn.close()
+    units = _get_units()
+    obj = next((u for u in units if u["id"] == uid), None)
+    return jsonify(obj or {"id": uid, "unit_name": name, "symbol": symbol, "unit_system": unit_system, "description": description, "display_order": display_order}), 201
+
+
+@app.route('/api/units/<int:unit_id>', methods=['PATCH'])
+def api_unit_update(unit_id):
+    """Update a unit (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    updates = {}
+    if "unit_name" in data:
+        s = (str(data["unit_name"]) or "").strip()
+        if not s:
+            return jsonify({"error": "unit_name cannot be empty"}), 400
+        updates["unit_name"] = s
+    if "symbol" in data:
+        updates["symbol"] = (str(data["symbol"]) or "").strip() or None
+    if "unit_system" in data:
+        updates["unit_system"] = (str(data["unit_system"]) or "").strip() or None
+    if "description" in data:
+        updates["description"] = (str(data["description"]) or "").strip() or None
+    if "display_order" in data:
+        v = data["display_order"]
+        updates["display_order"] = int(v) if v is not None and v != "" else None
+    if not updates:
+        return jsonify({"error": "No valid fields to update"}), 400
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM tbl_unit WHERE unit_id = %s;", (unit_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Unit not found"}), 404
+    set_clause = ", ".join(f"{k} = %s" for k in updates) + ", updated_at = CURRENT_TIMESTAMP"
+    vals = [updates[k] for k in updates]
+    cur.execute(f"UPDATE tbl_unit SET {set_clause} WHERE unit_id = %s;", vals + [unit_id])
+    conn.commit()
+    cur.close()
+    conn.close()
+    units = _get_units()
+    obj = next((u for u in units if u["id"] == unit_id), None)
+    return jsonify(obj), 200
+
+
+@app.route('/api/units/<int:unit_id>', methods=['DELETE'])
+def api_unit_delete(unit_id):
+    """Delete a unit (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tbl_unit WHERE unit_id = %s RETURNING unit_id;", (unit_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted == 0:
+        return jsonify({"error": "Unit not found"}), 404
+    return jsonify({"message": "Unit deleted"}), 200
+
+
 # Route to fetch all formulas (with optional discipline filtering)
 @app.route('/api/formulas', methods=['GET'])
 def fetch_formulas():
