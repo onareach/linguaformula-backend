@@ -110,7 +110,7 @@ def get_formulas():
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
-    cursor.execute("SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization, symbolic_verbalization FROM tbl_formula ORDER BY display_order;")
+    cursor.execute("SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization, symbolic_verbalization FROM tbl_formula ORDER BY formula_name;")
     formulas = cursor.fetchall()
     result = [{"id": row[0], "formula_name": row[1], "latex": row[2], "display_order": row[3], 
                "formula_description": row[4], "english_verbalization": row[5], "symbolic_verbalization": row[6]} for row in formulas]
@@ -139,7 +139,7 @@ def get_formulas_by_disciplines(discipline_ids, include_children=True):
             FROM tbl_formula f
             INNER JOIN tbl_formula_discipline fd ON f.formula_id = fd.formula_id
             INNER JOIN discipline_tree dt ON fd.discipline_id = dt.discipline_id
-            ORDER BY f.display_order;
+            ORDER BY f.formula_name;
         """, (discipline_ids,))
     else:
         # Only get formulas directly linked to the selected disciplines
@@ -149,7 +149,7 @@ def get_formulas_by_disciplines(discipline_ids, include_children=True):
             FROM tbl_formula f
             INNER JOIN tbl_formula_discipline fd ON f.formula_id = fd.formula_id
             WHERE fd.discipline_id = ANY(%s)
-            ORDER BY f.display_order;
+            ORDER BY f.formula_name;
         """, (discipline_ids,))
     
     formulas = cursor.fetchall()
@@ -389,12 +389,12 @@ def get_terms():
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT term_id, term_name, definition, display_order
+        SELECT term_id, term_name, definition, display_order, formulaic_expression
         FROM tbl_term
-        ORDER BY COALESCE(display_order, 999), term_name;
+        ORDER BY term_name;
     """)
     terms = cursor.fetchall()
-    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3]} for row in terms]
+    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3], "formulaic_expression": row[4]} for row in terms]
     cursor.close()
     conn.close()
     return result
@@ -414,22 +414,22 @@ def get_terms_by_disciplines(discipline_ids, include_children=True):
                 FROM tbl_discipline d
                 INNER JOIN discipline_tree dt ON d.discipline_parent_id = dt.discipline_id
             )
-            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.display_order
+            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.display_order, t.formulaic_expression
             FROM tbl_term t
             INNER JOIN tbl_term_discipline td ON t.term_id = td.term_id
             INNER JOIN discipline_tree dt ON td.discipline_id = dt.discipline_id
-            ORDER BY t.display_order, t.term_name;
+            ORDER BY t.term_name;
         """, (discipline_ids,))
     else:
         cursor.execute("""
-            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.display_order
+            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.display_order, t.formulaic_expression
             FROM tbl_term t
             INNER JOIN tbl_term_discipline td ON t.term_id = td.term_id
             WHERE td.discipline_id = ANY(%s)
-            ORDER BY t.display_order, t.term_name;
+            ORDER BY t.term_name;
         """, (discipline_ids,))
     terms = cursor.fetchall()
-    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3]} for row in terms]
+    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3], "formulaic_expression": row[4]} for row in terms]
     cursor.close()
     conn.close()
     return result
@@ -441,7 +441,7 @@ def get_term_by_id(term_id):
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT term_id, term_name, definition, display_order
+        SELECT term_id, term_name, definition, display_order, formulaic_expression
         FROM tbl_term
         WHERE term_id = %s;
     """, (term_id,))
@@ -450,7 +450,7 @@ def get_term_by_id(term_id):
     conn.close()
     if not row:
         return None
-    return {"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3]}
+    return {"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3], "formulaic_expression": row[4]}
 
 
 def get_questions_by_term_id(term_id):
@@ -539,6 +539,25 @@ def fetch_term_questions(term_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/terms/<int:term_id>', methods=['DELETE'])
+def api_term_delete(term_id):
+    """Delete a term (admin only). Cascades to tbl_term_discipline, tbl_term_question."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tbl_term WHERE term_id = %s RETURNING term_id;", (term_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted == 0:
+        return jsonify({"error": "Term not found"}), 404
+    return jsonify({"message": "Term deleted"}), 200
+
+
 # Route to fetch all formulas (with optional discipline filtering)
 @app.route('/api/formulas', methods=['GET'])
 def fetch_formulas():
@@ -554,6 +573,82 @@ def fetch_formulas():
         return jsonify(formulas)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+@app.route('/api/formulas/<int:formula_id>', methods=['DELETE'])
+def api_formula_delete(formula_id):
+    """Delete a formula (admin only). Cascades to related tables."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tbl_formula WHERE formula_id = %s RETURNING formula_id;", (formula_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted == 0:
+        return jsonify({"error": "Formula not found"}), 404
+    return jsonify({"message": "Formula deleted"}), 200
+
+
+@app.route('/api/formulas/<int:formula_id>', methods=['PATCH'])
+def api_formula_update(formula_id):
+    """Update a formula (admin only). Accepts partial updates."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    allowed = {"formula_name", "latex", "display_order", "formula_description", "english_verbalization",
+               "symbolic_verbalization", "example", "historical_context", "units"}
+    updates = {}
+    for k in allowed:
+        if k not in data:
+            continue
+        v = data[k]
+        if k == "formula_name":
+            s = (str(v) if v is not None else "").strip()
+            if not s:
+                return jsonify({"error": "formula_name cannot be empty"}), 400
+            updates[k] = s
+        elif k == "latex":
+            s = (str(v) if v is not None else "").strip()
+            if not s:
+                return jsonify({"error": "latex cannot be empty"}), 400
+            updates[k] = s
+        elif k == "display_order":
+            if v is None or v == "":
+                updates[k] = None
+            else:
+                try:
+                    updates[k] = int(v)
+                except (TypeError, ValueError):
+                    return jsonify({"error": "display_order must be an integer"}), 400
+        else:
+            updates[k] = None if v is None or (isinstance(v, str) and not v.strip()) else v.strip() if isinstance(v, str) else v
+    if not updates:
+        return jsonify({"error": "No valid fields to update"}), 400
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("SELECT formula_id FROM tbl_formula WHERE formula_id = %s;", (formula_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Formula not found"}), 404
+    set_clause = ", ".join(f"{k} = %s" for k in updates)
+    set_clause += ", updated_at = CURRENT_TIMESTAMP"
+    vals = [updates[k] for k in updates]
+    cur.execute(f"UPDATE tbl_formula SET {set_clause} WHERE formula_id = %s;", vals + [formula_id])
+    conn.commit()
+    cur.close()
+    conn.close()
+    formula = get_formula_by_id(formula_id)
+    return jsonify(formula), 200
+
 
 # Route to fetch a single formula by ID
 @app.route('/api/formulas/<int:formula_id>', methods=['GET'])

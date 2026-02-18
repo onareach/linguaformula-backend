@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Seed tbl_term with initial terms (Population, Sample, Population size, Sample size),
+Seed tbl_term with initial terms (population, sample, population size, sample size),
 link them to Statistics discipline, and create multiple-choice and true/false
 definition questions with plausible wrong answers.
 
@@ -8,7 +8,7 @@ Run after: migrations/add_terms_tables.sql
   Local: python seed_terms_and_questions.py
   Heroku: heroku run python seed_terms_and_questions.py -a linguaformula-backend
 
-Safe to run multiple times: skips terms that already exist.
+Safe to run multiple times: skips terms that already exist. Uses lowercase term names.
 """
 import os
 import random
@@ -17,36 +17,36 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
     DATABASE_URL = "postgresql://dev_user:dev123@localhost:5432/linguaformula?sslmode=disable"
 
-# Terms: (term_name, definition)
+# Terms: (term_name, definition, formulaic_expression or None)
 TERMS = [
-    ("Population", "the entire group of individuals about which information is sought."),
-    ("Sample", "a subset of the population that is actually observed."),
-    ("Population size", "total number of individuals in the population."),
-    ("Sample size", "number of individuals in the sample."),
+    ("population", "the entire group of individuals about which information is sought.", None),
+    ("sample", "a subset of the population that is actually observed.", None),
+    ("population size", "total number of individuals in the population.", r"N"),
+    ("sample size", "number of individuals in the sample.", r"n"),
 ]
 
 # Multiple-choice: stem template "What does [term] mean?" with (definition, is_correct) choices.
 # Wrong definitions are plausible alternatives (definitions of related terms or common confusions).
 MC_QUESTIONS = {
-    "Population": [
+    "population": [
         ("the entire group of individuals about which information is sought.", True),
         ("a subset of the population that is actually observed.", False),  # sample
         ("the total number of individuals in the population.", False),    # population size
         ("the number of individuals in the sample.", False),               # sample size
     ],
-    "Sample": [
+    "sample": [
         ("a subset of the population that is actually observed.", True),
         ("the entire group of individuals about which information is sought.", False),  # population
         ("the total number of individuals in the population.", False),    # population size
         ("the number of individuals in the sample.", False),               # sample size
     ],
-    "Population size": [
+    "population size": [
         ("total number of individuals in the population.", True),
         ("the entire group of individuals about which information is sought.", False),  # population
         ("a subset of the population that is actually observed.", False),  # sample
         ("number of individuals in the sample.", False),                   # sample size
     ],
-    "Sample size": [
+    "sample size": [
         ("number of individuals in the sample.", True),
         ("the entire group of individuals about which information is sought.", False),  # population
         ("a subset of the population that is actually observed.", False),  # sample
@@ -56,21 +56,21 @@ MC_QUESTIONS = {
 
 # True/false: (stem, is_correct). Stem is "The term [X] means: [definition]."
 TF_QUESTIONS = {
-    "Population": [
-        ("The term Population means: the entire group of individuals about which information is sought.", True),
-        ("The term Population means: a subset of the population that is actually observed.", False),
+    "population": [
+        ("The term population means: the entire group of individuals about which information is sought.", True),
+        ("The term population means: a subset of the population that is actually observed.", False),
     ],
-    "Sample": [
-        ("The term Sample means: a subset of the population that is actually observed.", True),
-        ("The term Sample means: the total number of individuals in the population.", False),
+    "sample": [
+        ("The term sample means: a subset of the population that is actually observed.", True),
+        ("The term sample means: the total number of individuals in the population.", False),
     ],
-    "Population size": [
-        ("The term Population size means: total number of individuals in the population.", True),
-        ("The term Population size means: number of individuals in the sample.", False),
+    "population size": [
+        ("The term population size means: total number of individuals in the population.", True),
+        ("The term population size means: number of individuals in the sample.", False),
     ],
-    "Sample size": [
-        ("The term Sample size means: number of individuals in the sample.", True),
-        ("The term Sample size means: the entire group of individuals about which information is sought.", False),
+    "sample size": [
+        ("The term sample size means: number of individuals in the sample.", True),
+        ("The term sample size means: the entire group of individuals about which information is sought.", False),
     ],
 }
 
@@ -102,7 +102,7 @@ def run():
     questions_added = 0
     display_order = 0
 
-    for term_name, definition in TERMS:
+    for term_name, definition, formulaic_expr in TERMS:
         # Skip if term already exists (avoids duplicate terms and questions)
         cur.execute("SELECT term_id FROM tbl_term WHERE term_name = %s;", (term_name,))
         existing = cur.fetchone()
@@ -113,10 +113,10 @@ def run():
         # Insert term
         cur.execute(
             """
-            INSERT INTO tbl_term (term_name, definition, display_order)
-            VALUES (%s, %s, %s) RETURNING term_id;
+            INSERT INTO tbl_term (term_name, definition, display_order, formulaic_expression)
+            VALUES (%s, %s, %s, %s) RETURNING term_id;
             """,
-            (term_name, definition, display_order),
+            (term_name, definition, display_order, formulaic_expr),
         )
         term_id = cur.fetchone()[0]
         terms_added += 1
