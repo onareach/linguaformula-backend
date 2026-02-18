@@ -558,6 +558,62 @@ def api_term_delete(term_id):
     return jsonify({"message": "Term deleted"}), 200
 
 
+@app.route('/api/terms/<int:term_id>', methods=['PATCH'])
+def api_term_update(term_id):
+    """Update a term (admin only). Accepts partial updates."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    allowed = {"term_name", "definition", "display_order", "formulaic_expression"}
+    updates = {}
+    for k in allowed:
+        if k not in data:
+            continue
+        v = data[k]
+        if k == "term_name":
+            s = (str(v) if v is not None else "").strip()
+            if not s:
+                return jsonify({"error": "term_name cannot be empty"}), 400
+            updates[k] = s
+        elif k == "definition":
+            s = (str(v) if v is not None else "").strip()
+            if not s:
+                return jsonify({"error": "definition cannot be empty"}), 400
+            updates[k] = s
+        elif k == "display_order":
+            if v is None or v == "":
+                updates[k] = None
+            else:
+                try:
+                    updates[k] = int(v)
+                except (TypeError, ValueError):
+                    return jsonify({"error": "display_order must be an integer"}), 400
+        else:
+            updates[k] = None if v is None or (isinstance(v, str) and not v.strip()) else (v.strip() if isinstance(v, str) else v)
+    if not updates:
+        return jsonify({"error": "No valid fields to update"}), 400
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("SELECT term_id FROM tbl_term WHERE term_id = %s;", (term_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Term not found"}), 404
+    set_parts = [f"{k} = %s" for k in updates]
+    set_clause = ", ".join(set_parts) + ", updated_at = CURRENT_TIMESTAMP"
+    vals = [updates[k] for k in updates]
+    cur.execute(f"UPDATE tbl_term SET {set_clause} WHERE term_id = %s;", vals + [term_id])
+    conn.commit()
+    cur.close()
+    conn.close()
+    term = get_term_by_id(term_id)
+    return jsonify(term), 200
+
+
 # Route to fetch all formulas (with optional discipline filtering)
 @app.route('/api/formulas', methods=['GET'])
 def fetch_formulas():
