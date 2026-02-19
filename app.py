@@ -359,7 +359,7 @@ def fetch_disciplines():
                 ) as term_count
             FROM tbl_discipline d
             LEFT JOIN tbl_discipline p ON d.discipline_parent_id = p.discipline_id
-            ORDER BY COALESCE(d.discipline_parent_id, 0), d.discipline_name;
+            ORDER BY d.discipline_name;
         """)
         
         disciplines = cursor.fetchall()
@@ -382,6 +382,311 @@ def fetch_disciplines():
         return jsonify(result)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/disciplines', methods=['POST'])
+def api_discipline_create():
+    """Create a discipline (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    name = (data.get("discipline_name") or data.get("name") or "").strip()
+    if not name:
+        return jsonify({"error": "discipline_name is required"}), 400
+    handle = (data.get("discipline_handle") or data.get("handle") or "").strip()
+    if not handle:
+        return jsonify({"error": "discipline_handle is required"}), 400
+    description = (data.get("discipline_description") or data.get("description") or "").strip() or None
+    parent_id = data.get("discipline_parent_id") or data.get("parent_id")
+    if parent_id is not None and parent_id != "":
+        try:
+            parent_id = int(parent_id)
+        except (TypeError, ValueError):
+            parent_id = None
+    else:
+        parent_id = None
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO tbl_discipline (discipline_name, discipline_handle, discipline_description, discipline_parent_id)
+            VALUES (%s, %s, %s, %s) RETURNING discipline_id;
+        """, (name, handle, description, parent_id))
+        did = cur.fetchone()[0]
+        conn.commit()
+    except psycopg2.IntegrityError as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        if "discipline_handle" in str(e) or "unique" in str(e).lower():
+            return jsonify({"error": "discipline_handle already exists"}), 400
+        return jsonify({"error": str(e)}), 400
+    cur.execute("""
+        SELECT d.discipline_id, d.discipline_name, d.discipline_handle, d.discipline_description, d.discipline_parent_id,
+               p.discipline_name, p.discipline_handle
+        FROM tbl_discipline d
+        LEFT JOIN tbl_discipline p ON d.discipline_parent_id = p.discipline_id
+        WHERE d.discipline_id = %s;
+    """, (did,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    obj = {
+        "id": row[0], "name": row[1], "handle": row[2], "description": row[3], "parent_id": row[4],
+        "parent_name": row[5], "parent_handle": row[6], "formula_count": 0, "term_count": 0
+    }
+    return jsonify(obj), 201
+
+
+@app.route('/api/disciplines/<int:discipline_id>', methods=['PATCH'])
+def api_discipline_update(discipline_id):
+    """Update a discipline (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    updates = {}
+    if "discipline_name" in data or "name" in data:
+        s = (str(data.get("discipline_name") or data.get("name") or "")).strip()
+        if not s:
+            return jsonify({"error": "discipline_name cannot be empty"}), 400
+        updates["discipline_name"] = s
+    if "discipline_handle" in data or "handle" in data:
+        s = (str(data.get("discipline_handle") or data.get("handle") or "")).strip()
+        if not s:
+            return jsonify({"error": "discipline_handle cannot be empty"}), 400
+        updates["discipline_handle"] = s
+    if "discipline_description" in data or "description" in data:
+        updates["discipline_description"] = (str(data.get("discipline_description") or data.get("description") or "")).strip() or None
+    if "discipline_parent_id" in data or "parent_id" in data:
+        v = data.get("discipline_parent_id") or data.get("parent_id")
+        updates["discipline_parent_id"] = int(v) if v is not None and v != "" else None
+    if not updates:
+        return jsonify({"error": "No valid fields to update"}), 400
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM tbl_discipline WHERE discipline_id = %s;", (discipline_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Discipline not found"}), 404
+    try:
+        set_clause = ", ".join(f"{k} = %s" for k in updates) + ", updated_at = CURRENT_TIMESTAMP"
+        vals = [updates[k] for k in updates]
+        cur.execute(f"UPDATE tbl_discipline SET {set_clause} WHERE discipline_id = %s;", vals + [discipline_id])
+        conn.commit()
+    except psycopg2.IntegrityError as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        if "discipline_handle" in str(e) or "unique" in str(e).lower():
+            return jsonify({"error": "discipline_handle already exists"}), 400
+        return jsonify({"error": str(e)}), 400
+    cur.execute("""
+        SELECT d.discipline_id, d.discipline_name, d.discipline_handle, d.discipline_description, d.discipline_parent_id,
+               p.discipline_name, p.discipline_handle,
+               (SELECT COUNT(DISTINCT fd.formula_id) FROM tbl_formula_discipline fd
+                WHERE fd.discipline_id IN (WITH RECURSIVE subtree AS (
+                  SELECT discipline_id FROM tbl_discipline WHERE discipline_id = d.discipline_id
+                  UNION ALL SELECT child.discipline_id FROM tbl_discipline child
+                  INNER JOIN subtree s ON child.discipline_parent_id = s.discipline_id
+                ) SELECT discipline_id FROM subtree)),
+               (SELECT COUNT(DISTINCT td.term_id) FROM tbl_term_discipline td
+                WHERE td.discipline_id IN (WITH RECURSIVE subtree AS (
+                  SELECT discipline_id FROM tbl_discipline WHERE discipline_id = d.discipline_id
+                  UNION ALL SELECT child.discipline_id FROM tbl_discipline child
+                  INNER JOIN subtree s ON child.discipline_parent_id = s.discipline_id
+                ) SELECT discipline_id FROM subtree))
+        FROM tbl_discipline d
+        LEFT JOIN tbl_discipline p ON d.discipline_parent_id = p.discipline_id
+        WHERE d.discipline_id = %s;
+    """, (discipline_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    obj = {
+        "id": row[0], "name": row[1], "handle": row[2], "description": row[3], "parent_id": row[4],
+        "parent_name": row[5], "parent_handle": row[6], "formula_count": row[7] or 0, "term_count": row[8] or 0
+    }
+    return jsonify(obj), 200
+
+
+@app.route('/api/disciplines/import', methods=['POST'])
+def api_disciplines_import():
+    """Bulk import disciplines from JSON (admin only). Existing IDs are updated; new records (null/absent id) are inserted."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    items = data.get("disciplines")
+    if not isinstance(items, list):
+        return jsonify({"error": "disciplines array required"}), 400
+
+    seen_ids = set()
+    for i, row in enumerate(items):
+        if not isinstance(row, dict):
+            return jsonify({
+                "error": "Invalid file format.",
+                "details": [f"Record {i + 1} is not a valid object. Each discipline must be a JSON object with discipline_name and discipline_handle."]
+            }), 400
+        did = row.get("discipline_id") or row.get("id")
+        if did is not None:
+            try:
+                did = int(did)
+            except (TypeError, ValueError):
+                return jsonify({
+                    "error": "Invalid discipline_id.",
+                    "details": [f"Record {i + 1} has an invalid discipline_id. It must be a number, or omit the field to create a new record."]
+                }), 400
+            if did in seen_ids:
+                return jsonify({
+                    "error": "Duplicate discipline_id.",
+                    "details": [f"Record {i + 1} uses discipline_id {did}, which appears more than once. Each discipline_id must be unique in the file."]
+                }), 400
+            seen_ids.add(did)
+
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+
+    cur.execute("SELECT discipline_id, discipline_handle FROM tbl_discipline;")
+    rows_db = cur.fetchall()
+    existing_ids = {r[0] for r in rows_db}
+    handle_to_id = {r[1]: r[0] for r in rows_db if r[1]}
+
+    inserted = 0
+    updated = 0
+    errors = []
+
+    for i, row in enumerate(items):
+        did = row.get("discipline_id") or row.get("id")
+        if did is not None:
+            did = int(did)
+        name = (str(row.get("discipline_name") or row.get("name") or "")).strip()
+        handle = (str(row.get("discipline_handle") or row.get("handle") or "")).strip()
+        description = (str(row.get("discipline_description") or row.get("description") or "")).strip() or None
+        parent_id = row.get("discipline_parent_id") or row.get("parent_id")
+        parent_handle = (str(row.get("discipline_parent_handle") or row.get("parent_handle") or "")).strip() or None
+        if parent_id is not None and parent_id != "":
+            try:
+                parent_id = int(parent_id)
+            except (TypeError, ValueError):
+                parent_id = None
+        elif parent_handle:
+            parent_id = handle_to_id.get(parent_handle)
+            if parent_id is None:
+                label = name or handle or f"record {i + 1}"
+                errors.append(
+                    f"Record {i + 1} (\"{label}\"): The parent_handle \"{parent_handle}\" does not match any discipline. "
+                    "Check the spelling, or ensure the parent discipline appears earlier in the file."
+                )
+                continue
+        else:
+            parent_id = None
+
+        if not name:
+            errors.append(
+                f"Record {i + 1}: Missing discipline_name. Every discipline must have a name."
+            )
+            continue
+        if not handle:
+            errors.append(
+                f"Record {i + 1} (\"{name}\"): Missing discipline_handle. Every discipline must have a unique handle (e.g. physics, classical_mechanics)."
+            )
+            continue
+
+        if did is not None:
+            if did not in existing_ids:
+                errors.append(
+                    f"Record {i + 1} (\"{name}\"): discipline_id {did} does not exist in the database. "
+                    "To create a new discipline, omit the discipline_id field. To update an existing one, use a valid id from a recent download."
+                )
+                continue
+            try:
+                cur.execute("""
+                    UPDATE tbl_discipline SET discipline_name = %s, discipline_handle = %s, discipline_description = %s,
+                    discipline_parent_id = %s, updated_at = CURRENT_TIMESTAMP WHERE discipline_id = %s;
+                """, (name, handle, description, parent_id, did))
+                updated += 1
+            except psycopg2.IntegrityError as e:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                if "discipline_handle" in str(e) or "unique" in str(e).lower():
+                    return jsonify({
+                        "error": "Duplicate discipline_handle.",
+                        "details": [f"Record {i + 1} (\"{name}\"): The handle \"{handle}\" is already used by another discipline. Choose a different handle."]
+                    }), 400
+                return jsonify({"error": str(e)}), 400
+        else:
+            if parent_id is not None and parent_id not in existing_ids:
+                errors.append(
+                    f"Record {i + 1} (\"{name}\"): parent_id {parent_id} does not exist. "
+                    "Use an existing discipline_id, or use parent_handle to reference a discipline by its handle."
+                )
+                continue
+            try:
+                cur.execute("""
+                    INSERT INTO tbl_discipline (discipline_name, discipline_handle, discipline_description, discipline_parent_id)
+                    VALUES (%s, %s, %s, %s) RETURNING discipline_id;
+                """, (name, handle, description, parent_id))
+                new_id = cur.fetchone()[0]
+                existing_ids.add(new_id)
+                handle_to_id[handle] = new_id
+                inserted += 1
+            except psycopg2.IntegrityError as e:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                if "discipline_handle" in str(e) or "unique" in str(e).lower():
+                    return jsonify({
+                        "error": "Duplicate discipline_handle.",
+                        "details": [f"Record {i + 1} (\"{name}\"): The handle \"{handle}\" is already used by another discipline. Choose a different handle."]
+                    }), 400
+                return jsonify({"error": str(e)}), 400
+
+    if errors:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "error": "The file could not be imported. Please fix the following and try again.",
+            "details": errors
+        }), 400
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"message": "Import complete", "inserted": inserted, "updated": updated}), 200
+
+
+@app.route('/api/disciplines/<int:discipline_id>', methods=['DELETE'])
+def api_discipline_delete(discipline_id):
+    """Delete a discipline (admin only). Cascades to tbl_formula_discipline, tbl_term_discipline, child disciplines."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tbl_discipline WHERE discipline_id = %s RETURNING discipline_id;", (discipline_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted == 0:
+        return jsonify({"error": "Discipline not found"}), 404
+    return jsonify({"message": "Discipline deleted"}), 200
+
 
 def get_terms():
     """Get all terms."""
@@ -502,6 +807,206 @@ def get_questions_by_term_id(term_id):
     cursor.close()
     conn.close()
     return result
+
+
+# Terms export/import (admin only) - must be before /api/terms/<int:term_id>
+@app.route('/api/terms/export', methods=['GET'])
+def api_terms_export():
+    """Export all terms with discipline links as JSON (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT t.term_id, t.term_name, t.definition, t.display_order, t.formulaic_expression
+        FROM tbl_term t
+        ORDER BY t.term_name;
+    """)
+    terms_rows = cur.fetchall()
+    cur.execute("""
+        SELECT td.term_id, td.discipline_id, d.discipline_handle
+        FROM tbl_term_discipline td
+        INNER JOIN tbl_discipline d ON d.discipline_id = td.discipline_id;
+    """)
+    links = cur.fetchall()
+    cur.close()
+    conn.close()
+    disc_by_term = {}
+    for tid, did, handle in links:
+        disc_by_term.setdefault(tid, []).append({"discipline_id": did, "discipline_handle": handle})
+    terms = []
+    for row in terms_rows:
+        tid, name, definition, display_order, formulaic_expr = row
+        terms.append({
+            "term_id": tid,
+            "term_name": name,
+            "definition": definition or "",
+            "display_order": display_order,
+            "formulaic_expression": formulaic_expr,
+            "discipline_ids": [d["discipline_id"] for d in disc_by_term.get(tid, [])],
+            "discipline_handles": [d["discipline_handle"] for d in disc_by_term.get(tid, [])],
+        })
+    return jsonify({"exported_at": __import__("datetime").datetime.utcnow().isoformat() + "Z", "terms": terms})
+
+
+@app.route('/api/terms/import', methods=['POST'])
+def api_terms_import():
+    """Bulk import terms from JSON (admin only). Existing IDs are updated; new records (null/absent id) are inserted."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    items = data.get("terms")
+    if not isinstance(items, list):
+        return jsonify({"error": "terms array required"}), 400
+
+    seen_ids = set()
+    for i, row in enumerate(items):
+        if not isinstance(row, dict):
+            return jsonify({
+                "error": "Invalid file format.",
+                "details": [f"Record {i + 1} is not a valid object. Each term must be a JSON object with term_name and definition."]
+            }), 400
+        tid = row.get("term_id") or row.get("id")
+        if tid is not None:
+            try:
+                tid = int(tid)
+            except (TypeError, ValueError):
+                return jsonify({
+                    "error": "Invalid term_id.",
+                    "details": [f"Record {i + 1} has an invalid term_id. It must be a number, or omit the field to create a new record."]
+                }), 400
+            if tid in seen_ids:
+                return jsonify({
+                    "error": "Duplicate term_id.",
+                    "details": [f"Record {i + 1} uses term_id {tid}, which appears more than once."]
+                }), 400
+            seen_ids.add(tid)
+
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("SELECT term_id FROM tbl_term;")
+    existing_ids = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT discipline_id, discipline_handle FROM tbl_discipline;")
+    disc_rows = cur.fetchall()
+    handle_to_id = {(r[1].strip().lower() if r[1] else ""): r[0] for r in disc_rows if r[1]}
+    existing_disc_ids = {r[0] for r in disc_rows}
+
+    inserted = 0
+    updated = 0
+    errors = []
+    skipped_handles = set()
+
+    for i, row in enumerate(items):
+        tid = row.get("term_id") or row.get("id")
+        if tid is not None:
+            tid = int(tid)
+        name = (str(row.get("term_name") or row.get("name") or "")).strip()
+        definition = (str(row.get("definition") or "")).strip()
+        display_order = row.get("display_order")
+        formulaic_expr = row.get("formulaic_expression")
+        if formulaic_expr is not None and formulaic_expr != "":
+            formulaic_expr = str(formulaic_expr).strip() or None
+        else:
+            formulaic_expr = None
+        if display_order is not None and display_order != "":
+            try:
+                display_order = int(display_order)
+            except (TypeError, ValueError):
+                display_order = None
+        else:
+            display_order = None
+
+        disc_ids = []
+        for d in row.get("discipline_ids") or []:
+            try:
+                did = int(d) if not isinstance(d, int) else d
+                if did in existing_disc_ids and did not in disc_ids:
+                    disc_ids.append(did)
+            except (TypeError, ValueError):
+                pass
+        for h in row.get("discipline_handles") or []:
+            if isinstance(h, str) and h.strip():
+                did = handle_to_id.get(h.strip().lower())
+                if did is not None and did not in disc_ids:
+                    disc_ids.append(did)
+                elif did is None:
+                    skipped_handles.add(h.strip())
+
+        if not name:
+            errors.append(f"Record {i + 1}: Missing term_name.")
+            continue
+        if not definition:
+            errors.append(f"Record {i + 1} (\"{name}\"): Missing definition.")
+            continue
+
+        if tid is not None:
+            if tid not in existing_ids:
+                errors.append(
+                    f"Record {i + 1} (\"{name}\"): term_id {tid} does not exist. Omit term_id to create a new term."
+                )
+                continue
+            try:
+                cur.execute("""
+                    UPDATE tbl_term SET term_name = %s, definition = %s, display_order = %s, formulaic_expression = %s,
+                    updated_at = CURRENT_TIMESTAMP WHERE term_id = %s;
+                """, (name, definition, display_order, formulaic_expr, tid))
+                updated += 1
+                cur.execute("DELETE FROM tbl_term_discipline WHERE term_id = %s;", (tid,))
+                for did in disc_ids:
+                    cur.execute(
+                        "INSERT INTO tbl_term_discipline (term_id, discipline_id, term_discipline_is_primary, term_discipline_rank) VALUES (%s, %s, false, NULL);",
+                        (tid, did)
+                    )
+            except psycopg2.IntegrityError as e:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                return jsonify({"error": str(e)}), 400
+        else:
+            try:
+                cur.execute("""
+                    INSERT INTO tbl_term (term_name, definition, display_order, formulaic_expression)
+                    VALUES (%s, %s, %s, %s) RETURNING term_id;
+                """, (name, definition, display_order, formulaic_expr))
+                new_id = cur.fetchone()[0]
+                existing_ids.add(new_id)
+                inserted += 1
+                for did in disc_ids:
+                    cur.execute(
+                        "INSERT INTO tbl_term_discipline (term_id, discipline_id, term_discipline_is_primary, term_discipline_rank) VALUES (%s, %s, false, NULL);",
+                        (new_id, did)
+                    )
+            except psycopg2.IntegrityError as e:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                return jsonify({"error": str(e)}), 400
+
+    if errors:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "error": "The file could not be imported. Please fix the following and try again.",
+            "details": errors
+        }), 400
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    resp = {"message": "Import complete", "inserted": inserted, "updated": updated}
+    if skipped_handles:
+        resp["skipped_discipline_handles"] = sorted(skipped_handles)
+        available = sorted(r[1] for r in disc_rows if r[1])
+        resp["available_discipline_handles"] = available
+        resp["warning"] = f"Skipped {len(skipped_handles)} discipline handle(s) not found. Requested: {sorted(skipped_handles)}. In database: {available}."
+    return jsonify(resp), 200
 
 
 # Route to fetch all terms (with optional discipline filtering)
@@ -868,6 +1373,218 @@ def api_unit_delete(unit_id):
     if deleted == 0:
         return jsonify({"error": "Unit not found"}), 404
     return jsonify({"message": "Unit deleted"}), 200
+
+
+# Formulas export/import (admin only) - must be before /api/formulas/<int:formula_id>
+@app.route('/api/formulas/export', methods=['GET'])
+def api_formulas_export():
+    """Export all formulas with discipline links as JSON (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization,
+               symbolic_verbalization, units, example, historical_context
+        FROM tbl_formula
+        ORDER BY formula_name;
+    """)
+    formulas_rows = cur.fetchall()
+    cur.execute("""
+        SELECT fd.formula_id, fd.discipline_id, d.discipline_handle
+        FROM tbl_formula_discipline fd
+        INNER JOIN tbl_discipline d ON d.discipline_id = fd.discipline_id;
+    """)
+    links = cur.fetchall()
+    cur.close()
+    conn.close()
+    disc_by_formula = {}
+    for fid, did, handle in links:
+        disc_by_formula.setdefault(fid, []).append({"discipline_id": did, "discipline_handle": handle})
+    formulas = []
+    for row in formulas_rows:
+        fid, name, latex, display_order, desc, eng_verb, sym_verb, units, example, hist = row
+        formulas.append({
+            "formula_id": fid,
+            "formula_name": name,
+            "latex": latex or "",
+            "display_order": display_order,
+            "formula_description": desc,
+            "english_verbalization": eng_verb,
+            "symbolic_verbalization": sym_verb,
+            "units": units,
+            "example": example,
+            "historical_context": hist,
+            "discipline_ids": [d["discipline_id"] for d in disc_by_formula.get(fid, [])],
+            "discipline_handles": [d["discipline_handle"] for d in disc_by_formula.get(fid, [])],
+        })
+    return jsonify({"exported_at": __import__("datetime").datetime.utcnow().isoformat() + "Z", "formulas": formulas})
+
+
+@app.route('/api/formulas/import', methods=['POST'])
+def api_formulas_import():
+    """Bulk import formulas from JSON (admin only). Existing IDs are updated; new records (null/absent id) are inserted."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    items = data.get("formulas")
+    if not isinstance(items, list):
+        return jsonify({"error": "formulas array required"}), 400
+
+    seen_ids = set()
+    for i, row in enumerate(items):
+        if not isinstance(row, dict):
+            return jsonify({
+                "error": "Invalid file format.",
+                "details": [f"Record {i + 1} is not a valid object. Each formula must have formula_name and latex."]
+            }), 400
+        fid = row.get("formula_id") or row.get("id")
+        if fid is not None:
+            try:
+                fid = int(fid)
+            except (TypeError, ValueError):
+                return jsonify({
+                    "error": "Invalid formula_id.",
+                    "details": [f"Record {i + 1} has an invalid formula_id. Omit to create a new record."]
+                }), 400
+            if fid in seen_ids:
+                return jsonify({
+                    "error": "Duplicate formula_id.",
+                    "details": [f"Record {i + 1} uses formula_id {fid} more than once."]
+                }), 400
+            seen_ids.add(fid)
+
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("SELECT formula_id FROM tbl_formula;")
+    existing_ids = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT discipline_id, discipline_handle FROM tbl_discipline;")
+    disc_rows = cur.fetchall()
+    handle_to_id = {(r[1].strip().lower() if r[1] else ""): r[0] for r in disc_rows if r[1]}
+    existing_disc_ids = {r[0] for r in disc_rows}
+
+    inserted = 0
+    updated = 0
+    errors = []
+    skipped_handles = set()
+
+    def _opt(v):
+        return None if v is None or v == "" else (str(v).strip() or None)
+
+    for i, row in enumerate(items):
+        fid = row.get("formula_id") or row.get("id")
+        if fid is not None:
+            fid = int(fid)
+        name = (str(row.get("formula_name") or row.get("name") or "")).strip()
+        latex = (str(row.get("latex") or "")).strip()
+        display_order = row.get("display_order")
+        if display_order is not None and display_order != "":
+            try:
+                display_order = int(display_order)
+            except (TypeError, ValueError):
+                display_order = None
+        else:
+            display_order = None
+        desc = _opt(row.get("formula_description") or row.get("description"))
+        eng_verb = _opt(row.get("english_verbalization"))
+        sym_verb = _opt(row.get("symbolic_verbalization"))
+        units = _opt(row.get("units"))
+        example = _opt(row.get("example"))
+        hist = _opt(row.get("historical_context"))
+
+        disc_ids = []
+        for d in row.get("discipline_ids") or []:
+            try:
+                did = int(d) if not isinstance(d, int) else d
+                if did in existing_disc_ids and did not in disc_ids:
+                    disc_ids.append(did)
+            except (TypeError, ValueError):
+                pass
+        for h in row.get("discipline_handles") or []:
+            if isinstance(h, str) and h.strip():
+                did = handle_to_id.get(h.strip().lower())
+                if did is not None and did not in disc_ids:
+                    disc_ids.append(did)
+                elif did is None:
+                    skipped_handles.add(h.strip())
+
+        if not name:
+            errors.append(f"Record {i + 1}: Missing formula_name.")
+            continue
+        if not latex:
+            errors.append(f"Record {i + 1} (\"{name}\"): Missing latex.")
+            continue
+
+        if fid is not None:
+            if fid not in existing_ids:
+                errors.append(
+                    f"Record {i + 1} (\"{name}\"): formula_id {fid} does not exist. Omit formula_id to create a new formula."
+                )
+                continue
+            try:
+                cur.execute("""
+                    UPDATE tbl_formula SET formula_name = %s, latex = %s, display_order = %s, formula_description = %s,
+                    english_verbalization = %s, symbolic_verbalization = %s, units = %s, example = %s, historical_context = %s,
+                    updated_at = CURRENT_TIMESTAMP WHERE formula_id = %s;
+                """, (name, latex, display_order, desc, eng_verb, sym_verb, units, example, hist, fid))
+                updated += 1
+                cur.execute("DELETE FROM tbl_formula_discipline WHERE formula_id = %s;", (fid,))
+                for did in disc_ids:
+                    cur.execute(
+                        "INSERT INTO tbl_formula_discipline (formula_id, discipline_id, formula_discipline_is_primary, formula_discipline_rank) VALUES (%s, %s, false, NULL);",
+                        (fid, did)
+                    )
+            except psycopg2.IntegrityError as e:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                return jsonify({"error": str(e)}), 400
+        else:
+            try:
+                cur.execute("""
+                    INSERT INTO tbl_formula (formula_name, latex, display_order, formula_description,
+                    english_verbalization, symbolic_verbalization, units, example, historical_context)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING formula_id;
+                """, (name, latex, display_order, desc, eng_verb, sym_verb, units, example, hist))
+                new_id = cur.fetchone()[0]
+                existing_ids.add(new_id)
+                inserted += 1
+                for did in disc_ids:
+                    cur.execute(
+                        "INSERT INTO tbl_formula_discipline (formula_id, discipline_id, formula_discipline_is_primary, formula_discipline_rank) VALUES (%s, %s, false, NULL);",
+                        (new_id, did)
+                    )
+            except psycopg2.IntegrityError as e:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                return jsonify({"error": str(e)}), 400
+
+    if errors:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "error": "The file could not be imported. Please fix the following and try again.",
+            "details": errors
+        }), 400
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    resp = {"message": "Import complete", "inserted": inserted, "updated": updated}
+    if skipped_handles:
+        resp["skipped_discipline_handles"] = sorted(skipped_handles)
+        available = sorted(r[1] for r in disc_rows if r[1])
+        resp["available_discipline_handles"] = available
+        resp["warning"] = f"Skipped {len(skipped_handles)} discipline handle(s) not found. Requested: {sorted(skipped_handles)}. In database: {available}."
+    return jsonify(resp), 200
 
 
 # Route to fetch all formulas (with optional discipline filtering)
