@@ -2054,6 +2054,227 @@ def api_questions_import():
     return jsonify({"message": "Import complete", "inserted": inserted, "updated": updated}), 200
 
 
+@app.route('/api/questions/<int:question_id>', methods=['GET'])
+def api_question_get(question_id):
+    """Get a single question with formula_ids and term_ids (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT question_id, question_type, stem, explanation, display_order
+        FROM tbl_question WHERE question_id = %s AND parent_question_id IS NULL;
+    """, (question_id,))
+    row = cur.fetchone()
+    if row is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Question not found"}), 404
+    qid, qtype, stem, explanation, display_order = row
+    cur.execute("""
+        SELECT a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+        FROM tbl_question_answer qa
+        INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+        WHERE qa.question_id = %s
+        ORDER BY qa.display_order, qa.question_answer_id;
+    """, (qid,))
+    answers = [
+        {"answer_text": r[0] or "", "answer_numeric": float(r[1]) if r[1] is not None else None, "is_correct": r[2], "display_order": r[3]}
+        for r in cur.fetchall()
+    ]
+    cur.execute("SELECT formula_id FROM tbl_formula_question WHERE question_id = %s;", (qid,))
+    formula_ids = [r[0] for r in cur.fetchall()]
+    cur.execute("SELECT term_id FROM tbl_term_question WHERE question_id = %s;", (qid,))
+    term_ids = [r[0] for r in cur.fetchall()]
+    item = {
+        "question_id": qid,
+        "question_type": qtype,
+        "stem": stem or "",
+        "explanation": explanation or "",
+        "display_order": display_order,
+        "answers": answers,
+        "formula_ids": formula_ids,
+        "term_ids": term_ids,
+    }
+    if qtype == "multipart":
+        cur.execute("""
+            SELECT question_id, part_label, stem, display_order
+            FROM tbl_question
+            WHERE parent_question_id = %s
+            ORDER BY display_order, question_id;
+        """, (qid,))
+        parts = []
+        for pr in cur.fetchall():
+            pid, plabel, pstem, pord = pr
+            cur.execute("""
+                SELECT a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+                FROM tbl_question_answer qa
+                INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+                WHERE qa.question_id = %s
+                ORDER BY qa.display_order;
+            """, (pid,))
+            part_answers = [
+                {"answer_text": r[0] or "", "answer_numeric": float(r[1]) if r[1] is not None else None, "is_correct": r[2], "display_order": r[3]}
+                for r in cur.fetchall()
+            ]
+            parts.append({"question_id": pid, "part_label": plabel or "", "stem": pstem or "", "display_order": pord, "answers": part_answers})
+        item["parts"] = parts
+    cur.close()
+    conn.close()
+    return jsonify(item)
+
+
+@app.route('/api/questions/<int:question_id>', methods=['PATCH'])
+def api_question_update(question_id):
+    """Update a single question (admin only). Accepts same structure as import."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("SELECT question_id FROM tbl_question WHERE question_id = %s;", (question_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Question not found"}), 404
+    qtype = (str(data.get("question_type") or "")).strip()
+    stem = (str(data.get("stem") or "")).strip()
+    explanation = data.get("explanation")
+    explanation = (str(explanation).strip() or None) if explanation is not None else None
+    display_order = data.get("display_order")
+    try:
+        display_order = int(display_order) if display_order is not None else 0
+    except (TypeError, ValueError):
+        display_order = 0
+    formula_ids = data.get("formula_ids") or []
+    term_ids = data.get("term_ids") or []
+    if qtype not in ("multiple_choice", "true_false", "word_problem", "multipart"):
+        cur.close()
+        conn.close()
+        return jsonify({"error": "question_type must be one of: multiple_choice, true_false, word_problem, multipart"}), 400
+    if not stem:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "stem is required"}), 400
+    try:
+        cur.execute(
+            "UPDATE tbl_question SET question_type = %s, stem = %s, explanation = %s, display_order = %s, updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
+            (qtype, stem, explanation, display_order, question_id),
+        )
+        cur.execute("SELECT formula_id FROM tbl_formula;")
+        existing_formula_ids = {r[0] for r in cur.fetchall()}
+        cur.execute("SELECT term_id FROM tbl_term;")
+        existing_term_ids = {r[0] for r in cur.fetchall()}
+
+        def _upsert_answers(c, qid, answers):
+            c.execute("DELETE FROM tbl_question_answer WHERE question_id = %s;", (qid,))
+            for a in answers or []:
+                atext = (str(a.get("answer_text") or "")).strip()
+                anum = a.get("answer_numeric")
+                if anum is not None:
+                    try:
+                        anum = float(anum)
+                    except (TypeError, ValueError):
+                        anum = None
+                is_correct = bool(a.get("is_correct"))
+                dord = a.get("display_order")
+                try:
+                    dord = int(dord) if dord is not None else 0
+                except (TypeError, ValueError):
+                    dord = 0
+                c.execute("INSERT INTO tbl_answer (answer_text, answer_numeric) VALUES (%s, %s) RETURNING answer_id;", (atext, anum))
+                aid = c.fetchone()[0]
+                c.execute("INSERT INTO tbl_question_answer (question_id, answer_id, is_correct, display_order) VALUES (%s, %s, %s, %s);", (qid, aid, is_correct, dord))
+
+        def _set_links(c, qid, fids, tids):
+            c.execute("DELETE FROM tbl_formula_question WHERE question_id = %s;", (qid,))
+            c.execute("DELETE FROM tbl_term_question WHERE question_id = %s;", (qid,))
+            for fid in fids or []:
+                try:
+                    fid = int(fid)
+                    if fid in existing_formula_ids:
+                        c.execute("INSERT INTO tbl_formula_question (formula_id, question_id, formula_question_is_primary) VALUES (%s, %s, true);", (fid, qid))
+                except (TypeError, ValueError):
+                    pass
+            for tid in tids or []:
+                try:
+                    tid = int(tid)
+                    if tid in existing_term_ids:
+                        c.execute("INSERT INTO tbl_term_question (term_id, question_id, term_question_is_primary) VALUES (%s, %s, true);", (tid, qid))
+                except (TypeError, ValueError):
+                    pass
+
+        _upsert_answers(cur, question_id, data.get("answers"))
+        if qtype == "multipart":
+            parts = data.get("parts") or []
+            cur.execute("SELECT question_id FROM tbl_question WHERE parent_question_id = %s;", (question_id,))
+            existing_parts = {r[0] for r in cur.fetchall()}
+            kept_part_ids = set()
+            for pi, p in enumerate(parts):
+                if not isinstance(p, dict):
+                    continue
+                pid = p.get("question_id") or p.get("id")
+                pid = int(pid) if pid is not None else None
+                plabel = (str(p.get("part_label") or "")).strip() or None
+                pstem = (str(p.get("stem") or "")).strip()
+                pord = p.get("display_order")
+                try:
+                    pord = int(pord) if pord is not None else pi
+                except (TypeError, ValueError):
+                    pord = pi
+                if pid is not None and pid in existing_parts:
+                    kept_part_ids.add(pid)
+                    cur.execute(
+                        "UPDATE tbl_question SET part_label = %s, stem = %s, display_order = %s, updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
+                        (plabel, pstem, pord, pid),
+                    )
+                    _upsert_answers(cur, pid, p.get("answers"))
+                else:
+                    cur.execute(
+                        "INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order) VALUES ('multipart', %s, %s, %s, %s) RETURNING question_id;",
+                        (pstem, question_id, plabel, pord),
+                    )
+                    new_pid = cur.fetchone()[0]
+                    _upsert_answers(cur, new_pid, p.get("answers"))
+            for rid in existing_parts - kept_part_ids:
+                cur.execute("DELETE FROM tbl_question WHERE question_id = %s;", (rid,))
+        _set_links(cur, question_id, formula_ids, term_ids)
+    except psycopg2.IntegrityError as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({"error": str(e)}), 400
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"message": "Question updated"}), 200
+
+
+@app.route('/api/questions/<int:question_id>', methods=['DELETE'])
+def api_question_delete(question_id):
+    """Delete a question (admin only). Cascades to answers and formula/term links."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tbl_question WHERE question_id = %s RETURNING question_id;", (question_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted == 0:
+        return jsonify({"error": "Question not found"}), 404
+    return jsonify({"message": "Question deleted"}), 200
+
+
 # ---------------------------------------------------------------------------
 # Auth: register, login, logout, me
 # ---------------------------------------------------------------------------
