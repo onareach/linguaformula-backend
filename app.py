@@ -110,10 +110,10 @@ def get_formulas():
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
-    cursor.execute("SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization, symbolic_verbalization FROM tbl_formula ORDER BY formula_name;")
+    cursor.execute("SELECT formula_id, formula_name, latex, formula_description, english_verbalization, symbolic_verbalization FROM tbl_formula ORDER BY formula_name;")
     formulas = cursor.fetchall()
-    result = [{"id": row[0], "formula_name": row[1], "latex": row[2], "display_order": row[3], 
-               "formula_description": row[4], "english_verbalization": row[5], "symbolic_verbalization": row[6]} for row in formulas]
+    result = [{"id": row[0], "formula_name": row[1], "latex": row[2], 
+               "formula_description": row[3], "english_verbalization": row[4], "symbolic_verbalization": row[5]} for row in formulas]
     cursor.close()
     conn.close()
     return result
@@ -134,7 +134,7 @@ def get_formulas_by_disciplines(discipline_ids, include_children=True):
                 FROM tbl_discipline d
                 INNER JOIN discipline_tree dt ON d.discipline_parent_id = dt.discipline_id
             )
-            SELECT DISTINCT f.formula_id, f.formula_name, f.latex, f.display_order, 
+            SELECT DISTINCT f.formula_id, f.formula_name, f.latex,
                    f.formula_description, f.english_verbalization, f.symbolic_verbalization
             FROM tbl_formula f
             INNER JOIN tbl_formula_discipline fd ON f.formula_id = fd.formula_id
@@ -144,7 +144,7 @@ def get_formulas_by_disciplines(discipline_ids, include_children=True):
     else:
         # Only get formulas directly linked to the selected disciplines
         cursor.execute("""
-            SELECT DISTINCT f.formula_id, f.formula_name, f.latex, f.display_order,
+            SELECT DISTINCT f.formula_id, f.formula_name, f.latex,
                    f.formula_description, f.english_verbalization, f.symbolic_verbalization
             FROM tbl_formula f
             INNER JOIN tbl_formula_discipline fd ON f.formula_id = fd.formula_id
@@ -153,8 +153,8 @@ def get_formulas_by_disciplines(discipline_ids, include_children=True):
         """, (discipline_ids,))
     
     formulas = cursor.fetchall()
-    result = [{"id": row[0], "formula_name": row[1], "latex": row[2], "display_order": row[3], 
-               "formula_description": row[4], "english_verbalization": row[5], "symbolic_verbalization": row[6]} for row in formulas]
+    result = [{"id": row[0], "formula_name": row[1], "latex": row[2], 
+               "formula_description": row[3], "english_verbalization": row[4], "symbolic_verbalization": row[5]} for row in formulas]
     cursor.close()
     conn.close()
     return result
@@ -165,7 +165,7 @@ def get_formula_by_id(formula_id):
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
-    cursor.execute("SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization, symbolic_verbalization, units, example, historical_context FROM tbl_formula WHERE formula_id = %s;", (formula_id,))
+    cursor.execute("SELECT formula_id, formula_name, latex, formula_description, english_verbalization, symbolic_verbalization, units, example, historical_context FROM tbl_formula WHERE formula_id = %s;", (formula_id,))
     formula = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -175,13 +175,12 @@ def get_formula_by_id(formula_id):
             "id": formula[0],
             "formula_name": formula[1],
             "latex": formula[2],
-            "display_order": formula[3],
-            "formula_description": formula[4],
-            "english_verbalization": formula[5],
-            "symbolic_verbalization": formula[6],
-            "units": formula[7],
-            "example": formula[8],
-            "historical_context": formula[9]
+            "formula_description": formula[3],
+            "english_verbalization": formula[4],
+            "symbolic_verbalization": formula[5],
+            "units": formula[6],
+            "example": formula[7],
+            "historical_context": formula[8]
         }
     else:
         return None
@@ -694,12 +693,12 @@ def get_terms():
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT term_id, term_name, definition, display_order, formulaic_expression
+        SELECT term_id, term_name, definition, formulaic_expression
         FROM tbl_term
         ORDER BY term_name;
     """)
     terms = cursor.fetchall()
-    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3], "formulaic_expression": row[4]} for row in terms]
+    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "formulaic_expression": row[3]} for row in terms]
     cursor.close()
     conn.close()
     return result
@@ -719,7 +718,7 @@ def get_terms_by_disciplines(discipline_ids, include_children=True):
                 FROM tbl_discipline d
                 INNER JOIN discipline_tree dt ON d.discipline_parent_id = dt.discipline_id
             )
-            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.display_order, t.formulaic_expression
+            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.formulaic_expression
             FROM tbl_term t
             INNER JOIN tbl_term_discipline td ON t.term_id = td.term_id
             INNER JOIN discipline_tree dt ON td.discipline_id = dt.discipline_id
@@ -727,14 +726,14 @@ def get_terms_by_disciplines(discipline_ids, include_children=True):
         """, (discipline_ids,))
     else:
         cursor.execute("""
-            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.display_order, t.formulaic_expression
+            SELECT DISTINCT t.term_id, t.term_name, t.definition, t.formulaic_expression
             FROM tbl_term t
             INNER JOIN tbl_term_discipline td ON t.term_id = td.term_id
             WHERE td.discipline_id = ANY(%s)
             ORDER BY t.term_name;
         """, (discipline_ids,))
     terms = cursor.fetchall()
-    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3], "formulaic_expression": row[4]} for row in terms]
+    result = [{"id": row[0], "term_name": row[1], "definition": row[2], "formulaic_expression": row[3]} for row in terms]
     cursor.close()
     conn.close()
     return result
@@ -746,7 +745,7 @@ def get_term_by_id(term_id):
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT term_id, term_name, definition, display_order, formulaic_expression
+        SELECT term_id, term_name, definition, formulaic_expression
         FROM tbl_term
         WHERE term_id = %s;
     """, (term_id,))
@@ -755,7 +754,7 @@ def get_term_by_id(term_id):
     conn.close()
     if not row:
         return None
-    return {"id": row[0], "term_name": row[1], "definition": row[2], "display_order": row[3], "formulaic_expression": row[4]}
+    return {"id": row[0], "term_name": row[1], "definition": row[2], "formulaic_expression": row[3]}
 
 
 def get_questions_by_term_id(term_id):
@@ -820,7 +819,7 @@ def api_terms_export():
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
     cur.execute("""
-        SELECT t.term_id, t.term_name, t.definition, t.display_order, t.formulaic_expression
+        SELECT t.term_id, t.term_name, t.definition, t.formulaic_expression
         FROM tbl_term t
         ORDER BY t.term_name;
     """)
@@ -838,12 +837,11 @@ def api_terms_export():
         disc_by_term.setdefault(tid, []).append({"discipline_id": did, "discipline_handle": handle})
     terms = []
     for row in terms_rows:
-        tid, name, definition, display_order, formulaic_expr = row
+        tid, name, definition, formulaic_expr = row
         terms.append({
             "term_id": tid,
             "term_name": name,
             "definition": definition or "",
-            "display_order": display_order,
             "formulaic_expression": formulaic_expr,
             "discipline_ids": [d["discipline_id"] for d in disc_by_term.get(tid, [])],
             "discipline_handles": [d["discipline_handle"] for d in disc_by_term.get(tid, [])],
@@ -908,19 +906,11 @@ def api_terms_import():
             tid = int(tid)
         name = (str(row.get("term_name") or row.get("name") or "")).strip()
         definition = (str(row.get("definition") or "")).strip()
-        display_order = row.get("display_order")
         formulaic_expr = row.get("formulaic_expression")
         if formulaic_expr is not None and formulaic_expr != "":
             formulaic_expr = str(formulaic_expr).strip() or None
         else:
             formulaic_expr = None
-        if display_order is not None and display_order != "":
-            try:
-                display_order = int(display_order)
-            except (TypeError, ValueError):
-                display_order = None
-        else:
-            display_order = None
 
         disc_ids = []
         for d in row.get("discipline_ids") or []:
@@ -953,9 +943,9 @@ def api_terms_import():
                 continue
             try:
                 cur.execute("""
-                    UPDATE tbl_term SET term_name = %s, definition = %s, display_order = %s, formulaic_expression = %s,
+                    UPDATE tbl_term SET term_name = %s, definition = %s, formulaic_expression = %s,
                     updated_at = CURRENT_TIMESTAMP WHERE term_id = %s;
-                """, (name, definition, display_order, formulaic_expr, tid))
+                """, (name, definition, formulaic_expr, tid))
                 updated += 1
                 cur.execute("DELETE FROM tbl_term_discipline WHERE term_id = %s;", (tid,))
                 for did in disc_ids:
@@ -971,9 +961,9 @@ def api_terms_import():
         else:
             try:
                 cur.execute("""
-                    INSERT INTO tbl_term (term_name, definition, display_order, formulaic_expression)
-                    VALUES (%s, %s, %s, %s) RETURNING term_id;
-                """, (name, definition, display_order, formulaic_expr))
+                    INSERT INTO tbl_term (term_name, definition, formulaic_expression)
+                    VALUES (%s, %s, %s) RETURNING term_id;
+                """, (name, definition, formulaic_expr))
                 new_id = cur.fetchone()[0]
                 existing_ids.add(new_id)
                 inserted += 1
@@ -1072,7 +1062,7 @@ def api_term_update(term_id):
     data = request.get_json()
     if not data or not isinstance(data, dict):
         return jsonify({"error": "JSON body required"}), 400
-    allowed = {"term_name", "definition", "display_order", "formulaic_expression"}
+    allowed = {"term_name", "definition", "formulaic_expression"}
     updates = {}
     for k in allowed:
         if k not in data:
@@ -1088,14 +1078,6 @@ def api_term_update(term_id):
             if not s:
                 return jsonify({"error": "definition cannot be empty"}), 400
             updates[k] = s
-        elif k == "display_order":
-            if v is None or v == "":
-                updates[k] = None
-            else:
-                try:
-                    updates[k] = int(v)
-                except (TypeError, ValueError):
-                    return jsonify({"error": "display_order must be an integer"}), 400
         else:
             updates[k] = None if v is None or (isinstance(v, str) and not v.strip()) else (v.strip() if isinstance(v, str) else v)
     if not updates:
@@ -1128,13 +1110,13 @@ def _get_constants():
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
     cur.execute("""
-        SELECT constant_id, constant_name, symbol, value_text, description, display_order
+        SELECT constant_id, constant_name, symbol, value_text, description
         FROM tbl_constant ORDER BY constant_name;
     """)
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    return [{"id": r[0], "constant_name": r[1], "symbol": r[2], "value_text": r[3], "description": r[4], "display_order": r[5]} for r in rows]
+    return [{"id": r[0], "constant_name": r[1], "symbol": r[2], "value_text": r[3], "description": r[4]} for r in rows]
 
 
 def _get_units():
@@ -1142,13 +1124,13 @@ def _get_units():
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
     cur.execute("""
-        SELECT unit_id, unit_name, symbol, unit_system, description, display_order
+        SELECT unit_id, unit_name, symbol, unit_system, description
         FROM tbl_unit ORDER BY unit_name;
     """)
     rows = cur.fetchall()
     cur.close()
     conn.close()
-    return [{"id": r[0], "unit_name": r[1], "symbol": r[2], "unit_system": r[3], "description": r[4], "display_order": r[5]} for r in rows]
+    return [{"id": r[0], "unit_name": r[1], "symbol": r[2], "unit_system": r[3], "description": r[4]} for r in rows]
 
 
 @app.route('/api/constants', methods=['GET'])
@@ -1175,28 +1157,20 @@ def api_constant_create():
     symbol = (data.get("symbol") or "").strip() or None
     value_text = (data.get("value_text") or "").strip() or None
     description = (data.get("description") or "").strip() or None
-    display_order = data.get("display_order")
-    if display_order is not None and display_order != "":
-        try:
-            display_order = int(display_order)
-        except (TypeError, ValueError):
-            display_order = None
-    else:
-        display_order = None
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO tbl_constant (constant_name, symbol, value_text, description, display_order)
-        VALUES (%s, %s, %s, %s, %s) RETURNING constant_id;
-    """, (name, symbol, value_text, description, display_order))
+        INSERT INTO tbl_constant (constant_name, symbol, value_text, description)
+        VALUES (%s, %s, %s, %s) RETURNING constant_id;
+    """, (name, symbol, value_text, description))
     cid = cur.fetchone()[0]
     conn.commit()
     cur.close()
     conn.close()
     constants = _get_constants()
     obj = next((c for c in constants if c["id"] == cid), None)
-    return jsonify(obj or {"id": cid, "constant_name": name, "symbol": symbol, "value_text": value_text, "description": description, "display_order": display_order}), 201
+    return jsonify(obj or {"id": cid, "constant_name": name, "symbol": symbol, "value_text": value_text, "description": description}), 201
 
 
 @app.route('/api/constants/<int:constant_id>', methods=['PATCH'])
@@ -1220,9 +1194,6 @@ def api_constant_update(constant_id):
         updates["value_text"] = (str(data["value_text"]) or "").strip() or None
     if "description" in data:
         updates["description"] = (str(data["description"]) or "").strip() or None
-    if "display_order" in data:
-        v = data["display_order"]
-        updates["display_order"] = int(v) if v is not None and v != "" else None
     if not updates:
         return jsonify({"error": "No valid fields to update"}), 400
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
@@ -1287,28 +1258,20 @@ def api_unit_create():
     symbol = (data.get("symbol") or "").strip() or None
     unit_system = (data.get("unit_system") or "").strip() or None
     description = (data.get("description") or "").strip() or None
-    display_order = data.get("display_order")
-    if display_order is not None and display_order != "":
-        try:
-            display_order = int(display_order)
-        except (TypeError, ValueError):
-            display_order = None
-    else:
-        display_order = None
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO tbl_unit (unit_name, symbol, unit_system, description, display_order)
-        VALUES (%s, %s, %s, %s, %s) RETURNING unit_id;
-    """, (name, symbol, unit_system, description, display_order))
+        INSERT INTO tbl_unit (unit_name, symbol, unit_system, description)
+        VALUES (%s, %s, %s, %s) RETURNING unit_id;
+    """, (name, symbol, unit_system, description))
     uid = cur.fetchone()[0]
     conn.commit()
     cur.close()
     conn.close()
     units = _get_units()
     obj = next((u for u in units if u["id"] == uid), None)
-    return jsonify(obj or {"id": uid, "unit_name": name, "symbol": symbol, "unit_system": unit_system, "description": description, "display_order": display_order}), 201
+    return jsonify(obj or {"id": uid, "unit_name": name, "symbol": symbol, "unit_system": unit_system, "description": description}), 201
 
 
 @app.route('/api/units/<int:unit_id>', methods=['PATCH'])
@@ -1332,9 +1295,6 @@ def api_unit_update(unit_id):
         updates["unit_system"] = (str(data["unit_system"]) or "").strip() or None
     if "description" in data:
         updates["description"] = (str(data["description"]) or "").strip() or None
-    if "display_order" in data:
-        v = data["display_order"]
-        updates["display_order"] = int(v) if v is not None and v != "" else None
     if not updates:
         return jsonify({"error": "No valid fields to update"}), 400
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
@@ -1386,7 +1346,7 @@ def api_formulas_export():
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
     cur.execute("""
-        SELECT formula_id, formula_name, latex, display_order, formula_description, english_verbalization,
+        SELECT formula_id, formula_name, latex, formula_description, english_verbalization,
                symbolic_verbalization, units, example, historical_context
         FROM tbl_formula
         ORDER BY formula_name;
@@ -1405,12 +1365,11 @@ def api_formulas_export():
         disc_by_formula.setdefault(fid, []).append({"discipline_id": did, "discipline_handle": handle})
     formulas = []
     for row in formulas_rows:
-        fid, name, latex, display_order, desc, eng_verb, sym_verb, units, example, hist = row
+        fid, name, latex, desc, eng_verb, sym_verb, units, example, hist = row
         formulas.append({
             "formula_id": fid,
             "formula_name": name,
             "latex": latex or "",
-            "display_order": display_order,
             "formula_description": desc,
             "english_verbalization": eng_verb,
             "symbolic_verbalization": sym_verb,
@@ -1483,14 +1442,6 @@ def api_formulas_import():
             fid = int(fid)
         name = (str(row.get("formula_name") or row.get("name") or "")).strip()
         latex = (str(row.get("latex") or "")).strip()
-        display_order = row.get("display_order")
-        if display_order is not None and display_order != "":
-            try:
-                display_order = int(display_order)
-            except (TypeError, ValueError):
-                display_order = None
-        else:
-            display_order = None
         desc = _opt(row.get("formula_description") or row.get("description"))
         eng_verb = _opt(row.get("english_verbalization"))
         sym_verb = _opt(row.get("symbolic_verbalization"))
@@ -1529,10 +1480,10 @@ def api_formulas_import():
                 continue
             try:
                 cur.execute("""
-                    UPDATE tbl_formula SET formula_name = %s, latex = %s, display_order = %s, formula_description = %s,
+                    UPDATE tbl_formula SET formula_name = %s, latex = %s, formula_description = %s,
                     english_verbalization = %s, symbolic_verbalization = %s, units = %s, example = %s, historical_context = %s,
                     updated_at = CURRENT_TIMESTAMP WHERE formula_id = %s;
-                """, (name, latex, display_order, desc, eng_verb, sym_verb, units, example, hist, fid))
+                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist, fid))
                 updated += 1
                 cur.execute("DELETE FROM tbl_formula_discipline WHERE formula_id = %s;", (fid,))
                 for did in disc_ids:
@@ -1548,10 +1499,10 @@ def api_formulas_import():
         else:
             try:
                 cur.execute("""
-                    INSERT INTO tbl_formula (formula_name, latex, display_order, formula_description,
+                    INSERT INTO tbl_formula (formula_name, latex, formula_description,
                     english_verbalization, symbolic_verbalization, units, example, historical_context)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING formula_id;
-                """, (name, latex, display_order, desc, eng_verb, sym_verb, units, example, hist))
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING formula_id;
+                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist))
                 new_id = cur.fetchone()[0]
                 existing_ids.add(new_id)
                 inserted += 1
@@ -1646,7 +1597,7 @@ def api_formula_update(formula_id):
     data = request.get_json()
     if not data or not isinstance(data, dict):
         return jsonify({"error": "JSON body required"}), 400
-    allowed = {"formula_name", "latex", "display_order", "formula_description", "english_verbalization",
+    allowed = {"formula_name", "latex", "formula_description", "english_verbalization",
                "symbolic_verbalization", "example", "historical_context", "units"}
     updates = {}
     for k in allowed:
@@ -1663,14 +1614,6 @@ def api_formula_update(formula_id):
             if not s:
                 return jsonify({"error": "latex cannot be empty"}), 400
             updates[k] = s
-        elif k == "display_order":
-            if v is None or v == "":
-                updates[k] = None
-            else:
-                try:
-                    updates[k] = int(v)
-                except (TypeError, ValueError):
-                    return jsonify({"error": "display_order must be an integer"}), 400
         else:
             updates[k] = None if v is None or (isinstance(v, str) and not v.strip()) else v.strip() if isinstance(v, str) else v
     if not updates:
