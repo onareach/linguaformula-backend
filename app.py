@@ -1768,6 +1768,291 @@ def fetch_formula_questions(formula_id):
         return jsonify({"error": str(e)}), 500
 
 
+# Questions export/import (admin only)
+@app.route('/api/questions/export', methods=['GET'])
+def api_questions_export():
+    """Export all questions with answers and formula/term links as JSON (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT q.question_id, q.question_type, q.stem, q.explanation, q.display_order
+        FROM tbl_question q
+        WHERE q.parent_question_id IS NULL
+        ORDER BY q.display_order, q.question_id;
+    """)
+    rows = cur.fetchall()
+    formula_links = {}
+    cur.execute("SELECT formula_id, question_id FROM tbl_formula_question;")
+    for fid, qid in cur.fetchall():
+        formula_links.setdefault(qid, []).append(fid)
+    term_links = {}
+    cur.execute("SELECT term_id, question_id FROM tbl_term_question;")
+    for tid, qid in cur.fetchall():
+        term_links.setdefault(qid, []).append(tid)
+    questions_out = []
+    for r in rows:
+        qid, qtype, stem, explanation, display_order = r
+        cur.execute("""
+            SELECT a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+            FROM tbl_question_answer qa
+            INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+            WHERE qa.question_id = %s
+            ORDER BY qa.display_order, qa.question_answer_id;
+        """, (qid,))
+        answers = [
+            {"answer_text": row[0] or "", "answer_numeric": float(row[1]) if row[1] is not None else None, "is_correct": row[2], "display_order": row[3]}
+            for row in cur.fetchall()
+        ]
+        item = {
+            "question_id": qid,
+            "question_type": qtype,
+            "stem": stem or "",
+            "explanation": explanation or "",
+            "display_order": display_order,
+            "answers": answers,
+            "formula_ids": formula_links.get(qid, []),
+            "term_ids": term_links.get(qid, []),
+        }
+        if qtype == "multipart":
+            cur.execute("""
+                SELECT question_id, part_label, stem, display_order
+                FROM tbl_question
+                WHERE parent_question_id = %s
+                ORDER BY display_order, question_id;
+            """, (qid,))
+            parts = []
+            for pr in cur.fetchall():
+                pid, plabel, pstem, pord = pr
+                cur.execute("""
+                    SELECT a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+                    FROM tbl_question_answer qa
+                    INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+                    WHERE qa.question_id = %s
+                    ORDER BY qa.display_order;
+                """, (pid,))
+                part_answers = [
+                    {"answer_text": row[0] or "", "answer_numeric": float(row[1]) if row[1] is not None else None, "is_correct": row[2], "display_order": row[3]}
+                    for row in cur.fetchall()
+                ]
+                parts.append({"question_id": pid, "part_label": plabel or "", "stem": pstem or "", "display_order": pord, "answers": part_answers})
+            item["parts"] = parts
+        questions_out.append(item)
+    cur.close()
+    conn.close()
+    return jsonify({"exported_at": __import__("datetime").datetime.utcnow().isoformat() + "Z", "questions": questions_out})
+
+
+@app.route('/api/questions/import', methods=['POST'])
+def api_questions_import():
+    """Bulk import questions with answers from JSON (admin only). Existing question_id → update; null/absent → insert."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    items = data.get("questions")
+    if not isinstance(items, list):
+        return jsonify({"error": "questions array required"}), 400
+
+    seen_ids = set()
+    for i, row in enumerate(items):
+        if not isinstance(row, dict):
+            return jsonify({
+                "error": "Invalid file format.",
+                "details": [f"Record {i + 1} is not a valid object. Each question must have question_type and stem."]
+            }), 400
+        qid = row.get("question_id") or row.get("id")
+        if qid is not None:
+            try:
+                qid = int(qid)
+            except (TypeError, ValueError):
+                return jsonify({
+                    "error": "Invalid question_id.",
+                    "details": [f"Record {i + 1} has an invalid question_id. Omit to create a new record."]
+                }), 400
+            if qid in seen_ids:
+                return jsonify({
+                    "error": "Duplicate question_id.",
+                    "details": [f"Record {i + 1} uses question_id {qid} more than once."]
+                }), 400
+            seen_ids.add(qid)
+
+    sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
+    conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
+    cur = conn.cursor()
+    cur.execute("SELECT question_id FROM tbl_question;")
+    existing_ids = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT formula_id FROM tbl_formula;")
+    existing_formula_ids = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT term_id FROM tbl_term;")
+    existing_term_ids = {r[0] for r in cur.fetchall()}
+
+    inserted = 0
+    updated = 0
+    errors = []
+
+    def _upsert_question_answers(cur, question_id, answers):
+        cur.execute("DELETE FROM tbl_question_answer WHERE question_id = %s;", (question_id,))
+        for a in answers or []:
+            atext = (str(a.get("answer_text") or "")).strip()
+            anum = a.get("answer_numeric")
+            if anum is not None:
+                try:
+                    anum = float(anum)
+                except (TypeError, ValueError):
+                    anum = None
+            is_correct = bool(a.get("is_correct"))
+            dord = a.get("display_order")
+            try:
+                dord = int(dord) if dord is not None else 0
+            except (TypeError, ValueError):
+                dord = 0
+            cur.execute("INSERT INTO tbl_answer (answer_text, answer_numeric) VALUES (%s, %s) RETURNING answer_id;", (atext, anum))
+            aid = cur.fetchone()[0]
+            cur.execute("INSERT INTO tbl_question_answer (question_id, answer_id, is_correct, display_order) VALUES (%s, %s, %s, %s);", (question_id, aid, is_correct, dord))
+
+    def _set_formula_term_links(cur, question_id, formula_ids, term_ids):
+        cur.execute("DELETE FROM tbl_formula_question WHERE question_id = %s;", (question_id,))
+        cur.execute("DELETE FROM tbl_term_question WHERE question_id = %s;", (question_id,))
+        for fid in formula_ids or []:
+            try:
+                fid = int(fid)
+                if fid in existing_formula_ids:
+                    cur.execute("INSERT INTO tbl_formula_question (formula_id, question_id, formula_question_is_primary) VALUES (%s, %s, true);", (fid, question_id))
+            except (TypeError, ValueError):
+                pass
+        for tid in term_ids or []:
+            try:
+                tid = int(tid)
+                if tid in existing_term_ids:
+                    cur.execute("INSERT INTO tbl_term_question (term_id, question_id, term_question_is_primary) VALUES (%s, %s, true);", (tid, question_id))
+            except (TypeError, ValueError):
+                pass
+
+    for i, row in enumerate(items):
+        qid = row.get("question_id") or row.get("id")
+        if qid is not None:
+            qid = int(qid)
+        qtype = (str(row.get("question_type") or "")).strip()
+        stem = (str(row.get("stem") or "")).strip()
+        explanation = row.get("explanation")
+        explanation = (str(explanation).strip() or None) if explanation is not None else None
+        display_order = row.get("display_order")
+        try:
+            display_order = int(display_order) if display_order is not None else 0
+        except (TypeError, ValueError):
+            display_order = 0
+        formula_ids = row.get("formula_ids") or []
+        term_ids = row.get("term_ids") or []
+
+        if qtype not in ("multiple_choice", "true_false", "word_problem", "multipart"):
+            errors.append(f"Record {i + 1}: question_type must be one of: multiple_choice, true_false, word_problem, multipart.")
+            continue
+        if not stem:
+            errors.append(f"Record {i + 1}: Missing stem.")
+            continue
+
+        if qid is not None:
+            if qid not in existing_ids:
+                errors.append(f"Record {i + 1}: question_id {qid} does not exist. Omit to create a new question.")
+                continue
+            try:
+                cur.execute(
+                    "UPDATE tbl_question SET question_type = %s, stem = %s, explanation = %s, display_order = %s, updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
+                    (qtype, stem, explanation, display_order, qid),
+                )
+                updated += 1
+                _upsert_question_answers(cur, qid, row.get("answers"))
+                if qtype == "multipart":
+                    parts = row.get("parts") or []
+                    cur.execute("SELECT question_id FROM tbl_question WHERE parent_question_id = %s;", (qid,))
+                    existing_parts = {r[0] for r in cur.fetchall()}
+                    for pi, p in enumerate(parts):
+                        if not isinstance(p, dict):
+                            continue
+                        pid = p.get("question_id") or p.get("id")
+                        pid = int(pid) if pid is not None else None
+                        plabel = (str(p.get("part_label") or "")).strip() or None
+                        pstem = (str(p.get("stem") or "")).strip()
+                        pord = p.get("display_order")
+                        try:
+                            pord = int(pord) if pord is not None else pi
+                        except (TypeError, ValueError):
+                            pord = pi
+                        if pid is not None and pid in existing_parts:
+                            cur.execute(
+                                "UPDATE tbl_question SET part_label = %s, stem = %s, display_order = %s, updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
+                                (plabel, pstem, pord, pid),
+                            )
+                            _upsert_question_answers(cur, pid, p.get("answers"))
+                        else:
+                            cur.execute(
+                                "INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order) VALUES ('multipart', %s, %s, %s, %s) RETURNING question_id;",
+                                (pstem, qid, plabel, pord),
+                            )
+                            new_pid = cur.fetchone()[0]
+                            _upsert_question_answers(cur, new_pid, p.get("answers"))
+                _set_formula_term_links(cur, qid, formula_ids, term_ids)
+            except psycopg2.IntegrityError as e:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                return jsonify({"error": str(e)}), 400
+        else:
+            try:
+                cur.execute(
+                    "INSERT INTO tbl_question (question_type, stem, explanation, display_order) VALUES (%s, %s, %s, %s) RETURNING question_id;",
+                    (qtype, stem, explanation, display_order),
+                )
+                new_id = cur.fetchone()[0]
+                existing_ids.add(new_id)
+                inserted += 1
+                _upsert_question_answers(cur, new_id, row.get("answers"))
+                if qtype == "multipart":
+                    parts = row.get("parts") or []
+                    for pi, p in enumerate(parts):
+                        if not isinstance(p, dict):
+                            continue
+                        plabel = (str(p.get("part_label") or "")).strip() or None
+                        pstem = (str(p.get("stem") or "")).strip()
+                        pord = p.get("display_order")
+                        try:
+                            pord = int(pord) if pord is not None else pi
+                        except (TypeError, ValueError):
+                            pord = pi
+                        cur.execute(
+                            "INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order) VALUES ('multipart', %s, %s, %s, %s) RETURNING question_id;",
+                            (pstem, new_id, plabel, pord),
+                        )
+                        part_id = cur.fetchone()[0]
+                        _upsert_question_answers(cur, part_id, p.get("answers"))
+                _set_formula_term_links(cur, new_id, formula_ids, term_ids)
+            except psycopg2.IntegrityError as e:
+                conn.rollback()
+                cur.close()
+                conn.close()
+                return jsonify({"error": str(e)}), 400
+
+    if errors:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "error": "The file could not be imported. Please fix the following and try again.",
+            "details": errors
+        }), 400
+
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"message": "Import complete", "inserted": inserted, "updated": updated}), 200
+
+
 # ---------------------------------------------------------------------------
 # Auth: register, login, logout, me
 # ---------------------------------------------------------------------------
