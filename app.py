@@ -1603,6 +1603,21 @@ def fetch_formulas():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+@app.route('/api/formulas/with-questions', methods=['GET'])
+def fetch_formulas_with_questions():
+    """Return all formulas with their linked questions and answers. Public, no auth required."""
+    try:
+        formulas = get_formulas()
+        result = []
+        for f in formulas:
+            questions = get_questions_by_formula_id(f["id"])
+            result.append({"formula": f, "questions": questions})
+        return jsonify({"formulas": result})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/formulas/<int:formula_id>', methods=['DELETE'])
 def api_formula_delete(formula_id):
     """Delete a formula (admin only). Cascades to related tables."""
