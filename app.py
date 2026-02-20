@@ -530,7 +530,7 @@ def api_discipline_update(discipline_id):
 
 @app.route('/api/disciplines/import', methods=['POST'])
 def api_disciplines_import():
-    """Bulk import disciplines from JSON (admin only). Existing IDs are updated; new records (null/absent id) are inserted."""
+    """Bulk import disciplines from JSON (admin only). Match by discipline_handle only: if handle exists, update; else insert. IDs are never used for matching (cross-env sync)."""
     claims, err = _require_admin()
     if err:
         return err
@@ -541,28 +541,12 @@ def api_disciplines_import():
     if not isinstance(items, list):
         return jsonify({"error": "disciplines array required"}), 400
 
-    seen_ids = set()
     for i, row in enumerate(items):
         if not isinstance(row, dict):
             return jsonify({
                 "error": "Invalid file format.",
                 "details": [f"Record {i + 1} is not a valid object. Each discipline must be a JSON object with discipline_name and discipline_handle."]
             }), 400
-        did = row.get("discipline_id") or row.get("id")
-        if did is not None:
-            try:
-                did = int(did)
-            except (TypeError, ValueError):
-                return jsonify({
-                    "error": "Invalid discipline_id.",
-                    "details": [f"Record {i + 1} has an invalid discipline_id. It must be a number, or omit the field to create a new record."]
-                }), 400
-            if did in seen_ids:
-                return jsonify({
-                    "error": "Duplicate discipline_id.",
-                    "details": [f"Record {i + 1} uses discipline_id {did}, which appears more than once. Each discipline_id must be unique in the file."]
-                }), 400
-            seen_ids.add(did)
 
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
@@ -571,87 +555,75 @@ def api_disciplines_import():
     cur.execute("SELECT discipline_id, discipline_handle FROM tbl_discipline;")
     rows_db = cur.fetchall()
     existing_ids = {r[0] for r in rows_db}
-    handle_to_id = {r[1]: r[0] for r in rows_db if r[1]}
+    handle_to_id = {(r[1].strip().lower() if r[1] else ""): r[0] for r in rows_db if r[1]}
 
     inserted = 0
     updated = 0
     errors = []
+    seen_handles = set()
 
     for i, row in enumerate(items):
-        did = row.get("discipline_id") or row.get("id")
-        if did is not None:
-            did = int(did)
         name = (str(row.get("discipline_name") or row.get("name") or "")).strip()
-        handle = (str(row.get("discipline_handle") or row.get("handle") or "")).strip()
+        handle_raw = (str(row.get("discipline_handle") or row.get("handle") or "")).strip()
+        handle_key = handle_raw.lower() if handle_raw else ""
         description = (str(row.get("discipline_description") or row.get("description") or "")).strip() or None
-        parent_id = row.get("discipline_parent_id") or row.get("parent_id")
         parent_handle = (str(row.get("discipline_parent_handle") or row.get("parent_handle") or "")).strip() or None
-        if parent_id is not None and parent_id != "":
-            try:
-                parent_id = int(parent_id)
-            except (TypeError, ValueError):
-                parent_id = None
-        elif parent_handle:
-            parent_id = handle_to_id.get(parent_handle)
+        parent_id = None
+        if parent_handle:
+            parent_id = handle_to_id.get(parent_handle.strip().lower())
             if parent_id is None:
-                label = name or handle or f"record {i + 1}"
+                label = name or handle_raw or f"record {i + 1}"
                 errors.append(
                     f"Record {i + 1} (\"{label}\"): The parent_handle \"{parent_handle}\" does not match any discipline. "
                     "Check the spelling, or ensure the parent discipline appears earlier in the file."
                 )
                 continue
-        else:
-            parent_id = None
 
         if not name:
             errors.append(
                 f"Record {i + 1}: Missing discipline_name. Every discipline must have a name."
             )
             continue
-        if not handle:
+        if not handle_raw:
             errors.append(
                 f"Record {i + 1} (\"{name}\"): Missing discipline_handle. Every discipline must have a unique handle (e.g. physics, classical_mechanics)."
             )
             continue
+        if handle_key in seen_handles:
+            errors.append(
+                f"Record {i + 1} (\"{name}\"): The handle \"{handle_raw}\" appears more than once in the file. Each handle must be unique."
+            )
+            continue
+        seen_handles.add(handle_key)
 
-        if did is not None:
-            if did not in existing_ids:
-                errors.append(
-                    f"Record {i + 1} (\"{name}\"): discipline_id {did} does not exist in the database. "
-                    "To create a new discipline, omit the discipline_id field. To update an existing one, use a valid id from a recent download."
-                )
-                continue
+        match_id = handle_to_id.get(handle_key)
+        if match_id is not None:
             try:
                 cur.execute("""
-                    UPDATE tbl_discipline SET discipline_name = %s, discipline_handle = %s, discipline_description = %s,
+                    UPDATE tbl_discipline SET discipline_name = %s, discipline_description = %s,
                     discipline_parent_id = %s, updated_at = CURRENT_TIMESTAMP WHERE discipline_id = %s;
-                """, (name, handle, description, parent_id, did))
+                """, (name, description, parent_id, match_id))
                 updated += 1
             except psycopg2.IntegrityError as e:
                 conn.rollback()
                 cur.close()
                 conn.close()
-                if "discipline_handle" in str(e) or "unique" in str(e).lower():
-                    return jsonify({
-                        "error": "Duplicate discipline_handle.",
-                        "details": [f"Record {i + 1} (\"{name}\"): The handle \"{handle}\" is already used by another discipline. Choose a different handle."]
-                    }), 400
                 return jsonify({"error": str(e)}), 400
         else:
             if parent_id is not None and parent_id not in existing_ids:
                 errors.append(
                     f"Record {i + 1} (\"{name}\"): parent_id {parent_id} does not exist. "
-                    "Use an existing discipline_id, or use parent_handle to reference a discipline by its handle."
+                    "Use parent_handle to reference a discipline by its handle."
                 )
                 continue
             try:
                 cur.execute("""
                     INSERT INTO tbl_discipline (discipline_name, discipline_handle, discipline_description, discipline_parent_id)
                     VALUES (%s, %s, %s, %s) RETURNING discipline_id;
-                """, (name, handle, description, parent_id))
+                """, (name, handle_raw, description, parent_id))
                 new_id = cur.fetchone()[0]
                 existing_ids.add(new_id)
-                handle_to_id[handle] = new_id
+                handle_to_id[handle_key] = new_id
                 inserted += 1
             except psycopg2.IntegrityError as e:
                 conn.rollback()
@@ -660,7 +632,7 @@ def api_disciplines_import():
                 if "discipline_handle" in str(e) or "unique" in str(e).lower():
                     return jsonify({
                         "error": "Duplicate discipline_handle.",
-                        "details": [f"Record {i + 1} (\"{name}\"): The handle \"{handle}\" is already used by another discipline. Choose a different handle."]
+                        "details": [f"Record {i + 1} (\"{name}\"): The handle \"{handle_raw}\" is already used by another discipline. Choose a different handle."]
                     }), 400
                 return jsonify({"error": str(e)}), 400
 
@@ -863,7 +835,7 @@ def api_terms_export():
 
 @app.route('/api/terms/import', methods=['POST'])
 def api_terms_import():
-    """Bulk import terms from JSON (admin only). Existing IDs are updated; new records (null/absent id) are inserted."""
+    """Bulk import terms from JSON (admin only). Match by term_handle when present (cross-env safe); else by term_id if it exists in target; else INSERT."""
     claims, err = _require_admin()
     if err:
         return err
@@ -954,9 +926,9 @@ def api_terms_import():
         if not definition:
             errors.append(f"Record {i + 1} (\"{name}\"): Missing definition.")
             continue
-        if tid is not None and tid not in existing_ids:
-            errors.append(f"Record {i + 1} (\"{name}\"): term_id {tid} does not exist. Omit term_id or use term_handle to match.")
-            continue
+        # For cross-env import: term_id from source may not exist in target. Match by term_handle instead.
+        # Only error if we have tid, it doesn't exist, AND we have no way to match (no handle, and would need to update).
+        # In practice we match by handle when present, or INSERT when new - so we allow tid from source to be ignored.
 
         match_tid = None
         if tid is not None and tid in existing_ids:
