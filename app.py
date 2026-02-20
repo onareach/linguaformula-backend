@@ -1948,14 +1948,34 @@ def api_questions_import():
             display_order = int(display_order) if display_order is not None else 0
         except (TypeError, ValueError):
             display_order = 0
-        formula_ids = row.get("formula_ids") or []
-        term_ids = row.get("term_ids") or []
+        formula_ids = row.get("formula_ids")
+        term_ids = row.get("term_ids")
+        # Accept either plural arrays (formula_ids/term_ids) or single values
+        # (formula_id/term_id), then normalize to arrays for downstream logic.
+        if formula_ids is None and row.get("formula_id") is not None:
+            formula_ids = [row.get("formula_id")]
+        elif formula_ids is None:
+            formula_ids = []
+        elif not isinstance(formula_ids, list):
+            formula_ids = [formula_ids]
+
+        if term_ids is None and row.get("term_id") is not None:
+            term_ids = [row.get("term_id")]
+        elif term_ids is None:
+            term_ids = []
+        elif not isinstance(term_ids, list):
+            term_ids = [term_ids]
 
         if qtype not in ("multiple_choice", "true_false", "word_problem", "multipart"):
             errors.append(f"Record {i + 1}: question_type must be one of: multiple_choice, true_false, word_problem, multipart.")
             continue
         if not stem:
             errors.append(f"Record {i + 1}: Missing stem.")
+            continue
+        if len(formula_ids) == 0 and len(term_ids) == 0:
+            errors.append(
+                f"Record {i + 1}: Missing link. Include at least one formula_id/formula_ids or term_id/term_ids."
+            )
             continue
 
         if qid is not None:
