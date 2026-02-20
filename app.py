@@ -19,6 +19,7 @@ import jwt
 import bcrypt
 from datetime import datetime, timedelta
 import base64
+import re
 from PIL import Image
 import io
 import pytesseract
@@ -56,6 +57,16 @@ AUTH_COOKIE_NAME = "linguaformula_token"
 
 if OPENAI_API_KEY:
     openai.api_key = OPENAI_API_KEY
+
+def _slugify(s, max_len=80):
+    """Convert to slug: lowercase, replace non-alphanumeric with _, collapse, strip."""
+    if not s or not isinstance(s, str):
+        return ""
+    s = s.lower().strip()
+    s = re.sub(r"[^a-z0-9]+", "_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return s[:max_len] if len(s) > max_len else s
+
 
 def _auth_db():
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
@@ -819,7 +830,7 @@ def api_terms_export():
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
     cur.execute("""
-        SELECT t.term_id, t.term_name, t.definition, t.formulaic_expression
+        SELECT t.term_id, t.term_name, t.definition, t.formulaic_expression, t.term_handle
         FROM tbl_term t
         ORDER BY t.term_name;
     """)
@@ -837,9 +848,10 @@ def api_terms_export():
         disc_by_term.setdefault(tid, []).append({"discipline_id": did, "discipline_handle": handle})
     terms = []
     for row in terms_rows:
-        tid, name, definition, formulaic_expr = row
+        tid, name, definition, formulaic_expr, term_handle = row
         terms.append({
             "term_id": tid,
+            "term_handle": term_handle or "",
             "term_name": name,
             "definition": definition or "",
             "formulaic_expression": formulaic_expr,
@@ -888,8 +900,13 @@ def api_terms_import():
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
-    cur.execute("SELECT term_id FROM tbl_term;")
-    existing_ids = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT term_id, term_handle FROM tbl_term;")
+    term_rows = cur.fetchall()
+    existing_ids = {r[0] for r in term_rows}
+    handle_to_term_id = {}
+    for tid, h in term_rows:
+        if h and str(h).strip():
+            handle_to_term_id[str(h).strip().lower()] = tid
     cur.execute("SELECT discipline_id, discipline_handle FROM tbl_discipline;")
     disc_rows = cur.fetchall()
     handle_to_id = {(r[1].strip().lower() if r[1] else ""): r[0] for r in disc_rows if r[1]}
@@ -900,10 +917,13 @@ def api_terms_import():
     errors = []
     skipped_handles = set()
 
+    used_term_handles = {h for h in handle_to_term_id.keys()}
+
     for i, row in enumerate(items):
         tid = row.get("term_id") or row.get("id")
         if tid is not None:
             tid = int(tid)
+        term_handle_raw = (str(row.get("term_handle") or row.get("handle") or "")).strip()
         name = (str(row.get("term_name") or row.get("name") or "")).strip()
         definition = (str(row.get("definition") or "")).strip()
         formulaic_expr = row.get("formulaic_expression")
@@ -934,24 +954,29 @@ def api_terms_import():
         if not definition:
             errors.append(f"Record {i + 1} (\"{name}\"): Missing definition.")
             continue
+        if tid is not None and tid not in existing_ids:
+            errors.append(f"Record {i + 1} (\"{name}\"): term_id {tid} does not exist. Omit term_id or use term_handle to match.")
+            continue
 
-        if tid is not None:
-            if tid not in existing_ids:
-                errors.append(
-                    f"Record {i + 1} (\"{name}\"): term_id {tid} does not exist. Omit term_id to create a new term."
-                )
-                continue
+        match_tid = None
+        if tid is not None and tid in existing_ids:
+            match_tid = tid
+        elif term_handle_raw:
+            match_tid = handle_to_term_id.get(term_handle_raw.lower())
+
+        if match_tid is not None:
             try:
                 cur.execute("""
                     UPDATE tbl_term SET term_name = %s, definition = %s, formulaic_expression = %s,
+                    term_handle = COALESCE(NULLIF(TRIM(%s), ''), term_handle),
                     updated_at = CURRENT_TIMESTAMP WHERE term_id = %s;
-                """, (name, definition, formulaic_expr, tid))
+                """, (name, definition, formulaic_expr, term_handle_raw or None, match_tid))
                 updated += 1
-                cur.execute("DELETE FROM tbl_term_discipline WHERE term_id = %s;", (tid,))
+                cur.execute("DELETE FROM tbl_term_discipline WHERE term_id = %s;", (match_tid,))
                 for did in disc_ids:
                     cur.execute(
                         "INSERT INTO tbl_term_discipline (term_id, discipline_id, term_discipline_is_primary, term_discipline_rank) VALUES (%s, %s, false, NULL);",
-                        (tid, did)
+                        (match_tid, did)
                     )
             except psycopg2.IntegrityError as e:
                 conn.rollback()
@@ -959,13 +984,21 @@ def api_terms_import():
                 conn.close()
                 return jsonify({"error": str(e)}), 400
         else:
+            base = (term_handle_raw or _slugify(name) or f"term_{i + 1}").lower()
+            th = base
+            n = 2
+            while th in used_term_handles:
+                th = f"{base}_{n}"
+                n += 1
+            used_term_handles.add(th)
             try:
                 cur.execute("""
-                    INSERT INTO tbl_term (term_name, definition, formulaic_expression)
-                    VALUES (%s, %s, %s) RETURNING term_id;
-                """, (name, definition, formulaic_expr))
+                    INSERT INTO tbl_term (term_name, definition, formulaic_expression, term_handle)
+                    VALUES (%s, %s, %s, %s) RETURNING term_id;
+                """, (name, definition, formulaic_expr, th))
                 new_id = cur.fetchone()[0]
                 existing_ids.add(new_id)
+                handle_to_term_id[th.lower()] = new_id
                 inserted += 1
                 for did in disc_ids:
                     cur.execute(
@@ -1369,7 +1402,7 @@ def api_formulas_export():
     cur = conn.cursor()
     cur.execute("""
         SELECT formula_id, formula_name, latex, formula_description, english_verbalization,
-               symbolic_verbalization, units, example, historical_context
+               symbolic_verbalization, units, example, historical_context, formula_handle
         FROM tbl_formula
         ORDER BY formula_name;
     """)
@@ -1387,9 +1420,10 @@ def api_formulas_export():
         disc_by_formula.setdefault(fid, []).append({"discipline_id": did, "discipline_handle": handle})
     formulas = []
     for row in formulas_rows:
-        fid, name, latex, desc, eng_verb, sym_verb, units, example, hist = row
+        fid, name, latex, desc, eng_verb, sym_verb, units, example, hist, formula_handle = row
         formulas.append({
             "formula_id": fid,
+            "formula_handle": formula_handle or "",
             "formula_name": name,
             "latex": latex or "",
             "formula_description": desc,
@@ -1443,8 +1477,13 @@ def api_formulas_import():
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
-    cur.execute("SELECT formula_id FROM tbl_formula;")
-    existing_ids = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT formula_id, formula_handle FROM tbl_formula;")
+    formula_rows = cur.fetchall()
+    existing_ids = {r[0] for r in formula_rows}
+    handle_to_formula_id = {}
+    for fid, h in formula_rows:
+        if h and str(h).strip():
+            handle_to_formula_id[str(h).strip().lower()] = fid
     cur.execute("SELECT discipline_id, discipline_handle FROM tbl_discipline;")
     disc_rows = cur.fetchall()
     handle_to_id = {(r[1].strip().lower() if r[1] else ""): r[0] for r in disc_rows if r[1]}
@@ -1454,6 +1493,7 @@ def api_formulas_import():
     updated = 0
     errors = []
     skipped_handles = set()
+    used_formula_handles = {h for h in handle_to_formula_id.keys()}
 
     def _opt(v):
         return None if v is None or v == "" else (str(v).strip() or None)
@@ -1462,6 +1502,7 @@ def api_formulas_import():
         fid = row.get("formula_id") or row.get("id")
         if fid is not None:
             fid = int(fid)
+        formula_handle_raw = (str(row.get("formula_handle") or row.get("handle") or "")).strip()
         name = (str(row.get("formula_name") or row.get("name") or "")).strip()
         latex = (str(row.get("latex") or "")).strip()
         desc = _opt(row.get("formula_description") or row.get("description"))
@@ -1493,25 +1534,30 @@ def api_formulas_import():
         if not latex:
             errors.append(f"Record {i + 1} (\"{name}\"): Missing latex.")
             continue
+        if fid is not None and fid not in existing_ids:
+            errors.append(f"Record {i + 1} (\"{name}\"): formula_id {fid} does not exist. Omit formula_id or use formula_handle to match.")
+            continue
 
-        if fid is not None:
-            if fid not in existing_ids:
-                errors.append(
-                    f"Record {i + 1} (\"{name}\"): formula_id {fid} does not exist. Omit formula_id to create a new formula."
-                )
-                continue
+        match_fid = None
+        if fid is not None and fid in existing_ids:
+            match_fid = fid
+        elif formula_handle_raw:
+            match_fid = handle_to_formula_id.get(formula_handle_raw.lower())
+
+        if match_fid is not None:
             try:
                 cur.execute("""
                     UPDATE tbl_formula SET formula_name = %s, latex = %s, formula_description = %s,
                     english_verbalization = %s, symbolic_verbalization = %s, units = %s, example = %s, historical_context = %s,
+                    formula_handle = COALESCE(NULLIF(TRIM(%s), ''), formula_handle),
                     updated_at = CURRENT_TIMESTAMP WHERE formula_id = %s;
-                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist, fid))
+                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist, formula_handle_raw or None, match_fid))
                 updated += 1
-                cur.execute("DELETE FROM tbl_formula_discipline WHERE formula_id = %s;", (fid,))
+                cur.execute("DELETE FROM tbl_formula_discipline WHERE formula_id = %s;", (match_fid,))
                 for did in disc_ids:
                     cur.execute(
                         "INSERT INTO tbl_formula_discipline (formula_id, discipline_id, formula_discipline_is_primary, formula_discipline_rank) VALUES (%s, %s, false, NULL);",
-                        (fid, did)
+                        (match_fid, did)
                     )
             except psycopg2.IntegrityError as e:
                 conn.rollback()
@@ -1519,14 +1565,22 @@ def api_formulas_import():
                 conn.close()
                 return jsonify({"error": str(e)}), 400
         else:
+            base = (formula_handle_raw or _slugify(name) or f"formula_{i + 1}").lower()
+            fh = base
+            n = 2
+            while fh in used_formula_handles:
+                fh = f"{base}_{n}"
+                n += 1
+            used_formula_handles.add(fh)
             try:
                 cur.execute("""
                     INSERT INTO tbl_formula (formula_name, latex, formula_description,
-                    english_verbalization, symbolic_verbalization, units, example, historical_context)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING formula_id;
-                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist))
+                    english_verbalization, symbolic_verbalization, units, example, historical_context, formula_handle)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING formula_id;
+                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist, fh))
                 new_id = cur.fetchone()[0]
                 existing_ids.add(new_id)
+                handle_to_formula_id[fh] = new_id
                 inserted += 1
                 for did in disc_ids:
                     cur.execute(
@@ -1794,6 +1848,10 @@ def api_questions_export():
     cur.execute("SELECT term_id, question_id FROM tbl_term_question;")
     for tid, qid in cur.fetchall():
         term_links.setdefault(qid, []).append(tid)
+    cur.execute("SELECT term_id, term_handle FROM tbl_term WHERE term_handle IS NOT NULL AND term_handle != '';")
+    term_id_to_handle = {r[0]: r[1] for r in cur.fetchall()}
+    cur.execute("SELECT formula_id, formula_handle FROM tbl_formula WHERE formula_handle IS NOT NULL AND formula_handle != '';")
+    formula_id_to_handle = {r[0]: r[1] for r in cur.fetchall()}
     questions_out = []
     for r in rows:
         qid, qtype, stem, explanation, display_order = r
@@ -1808,6 +1866,8 @@ def api_questions_export():
             {"answer_text": row[0] or "", "answer_numeric": float(row[1]) if row[1] is not None else None, "is_correct": row[2], "display_order": row[3]}
             for row in cur.fetchall()
         ]
+        fids = formula_links.get(qid, [])
+        tids = term_links.get(qid, [])
         item = {
             "question_id": qid,
             "question_type": qtype,
@@ -1815,8 +1875,10 @@ def api_questions_export():
             "explanation": explanation or "",
             "display_order": display_order,
             "answers": answers,
-            "formula_ids": formula_links.get(qid, []),
-            "term_ids": term_links.get(qid, []),
+            "formula_ids": fids,
+            "formula_handles": [formula_id_to_handle[f] for f in fids if f in formula_id_to_handle],
+            "term_ids": tids,
+            "term_handles": [term_id_to_handle[t] for t in tids if t in term_id_to_handle],
         }
         if qtype == "multipart":
             cur.execute("""
@@ -1888,10 +1950,20 @@ def api_questions_import():
     cur = conn.cursor()
     cur.execute("SELECT question_id FROM tbl_question;")
     existing_ids = {r[0] for r in cur.fetchall()}
-    cur.execute("SELECT formula_id FROM tbl_formula;")
-    existing_formula_ids = {r[0] for r in cur.fetchall()}
-    cur.execute("SELECT term_id FROM tbl_term;")
-    existing_term_ids = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT formula_id, formula_handle FROM tbl_formula;")
+    formula_rows = cur.fetchall()
+    existing_formula_ids = {r[0] for r in formula_rows}
+    formula_handle_to_id = {}
+    for fid, h in formula_rows:
+        if h and str(h).strip():
+            formula_handle_to_id[str(h).strip().lower()] = fid
+    cur.execute("SELECT term_id, term_handle FROM tbl_term;")
+    term_rows = cur.fetchall()
+    existing_term_ids = {r[0] for r in term_rows}
+    term_handle_to_id = {}
+    for tid, h in term_rows:
+        if h and str(h).strip():
+            term_handle_to_id[str(h).strip().lower()] = tid
 
     inserted = 0
     updated = 0
@@ -1950,21 +2022,74 @@ def api_questions_import():
             display_order = 0
         formula_ids = row.get("formula_ids")
         term_ids = row.get("term_ids")
-        # Accept either plural arrays (formula_ids/term_ids) or single values
-        # (formula_id/term_id), then normalize to arrays for downstream logic.
+        formula_handles = row.get("formula_handles")
+        term_handles = row.get("term_handles")
         if formula_ids is None and row.get("formula_id") is not None:
             formula_ids = [row.get("formula_id")]
         elif formula_ids is None:
             formula_ids = []
         elif not isinstance(formula_ids, list):
             formula_ids = [formula_ids]
-
         if term_ids is None and row.get("term_id") is not None:
             term_ids = [row.get("term_id")]
         elif term_ids is None:
             term_ids = []
         elif not isinstance(term_ids, list):
             term_ids = [term_ids]
+        if formula_handles is None and row.get("formula_handle") is not None:
+            formula_handles = [row.get("formula_handle")]
+        elif formula_handles is None:
+            formula_handles = []
+        elif not isinstance(formula_handles, list):
+            formula_handles = [formula_handles]
+        if term_handles is None and row.get("term_handle") is not None:
+            term_handles = [row.get("term_handle")]
+        elif term_handles is None:
+            term_handles = []
+        elif not isinstance(term_handles, list):
+            term_handles = [term_handles]
+
+        resolved_formula_ids = []
+        if formula_handles:
+            skip_row = False
+            for h in formula_handles:
+                if isinstance(h, str) and h.strip():
+                    fid = formula_handle_to_id.get(h.strip().lower())
+                    if fid is not None:
+                        resolved_formula_ids.append(fid)
+                    else:
+                        errors.append(f"Record {i + 1}: formula_handle '{h}' not found.")
+                        skip_row = True
+                        break
+            if skip_row:
+                continue
+        else:
+            try:
+                resolved_formula_ids = [int(x) for x in formula_ids if x is not None and str(x).strip() != ""]
+            except (TypeError, ValueError):
+                resolved_formula_ids = []
+            resolved_formula_ids = [f for f in resolved_formula_ids if f in existing_formula_ids]
+
+        resolved_term_ids = []
+        if term_handles:
+            skip_row = False
+            for h in term_handles:
+                if isinstance(h, str) and h.strip():
+                    tid = term_handle_to_id.get(h.strip().lower())
+                    if tid is not None:
+                        resolved_term_ids.append(tid)
+                    else:
+                        errors.append(f"Record {i + 1}: term_handle '{h}' not found.")
+                        skip_row = True
+                        break
+            if skip_row:
+                continue
+        else:
+            try:
+                resolved_term_ids = [int(x) for x in term_ids if x is not None and str(x).strip() != ""]
+            except (TypeError, ValueError):
+                resolved_term_ids = []
+            resolved_term_ids = [t for t in resolved_term_ids if t in existing_term_ids]
 
         if qtype not in ("multiple_choice", "true_false", "word_problem", "multipart"):
             errors.append(f"Record {i + 1}: question_type must be one of: multiple_choice, true_false, word_problem, multipart.")
@@ -1972,11 +2097,14 @@ def api_questions_import():
         if not stem:
             errors.append(f"Record {i + 1}: Missing stem.")
             continue
-        if len(formula_ids) == 0 and len(term_ids) == 0:
+        if len(resolved_formula_ids) == 0 and len(resolved_term_ids) == 0:
             errors.append(
-                f"Record {i + 1}: Missing link. Include at least one formula_id/formula_ids or term_id/term_ids."
+                f"Record {i + 1}: Missing link. Include at least one formula_handle/formula_handles, formula_id/formula_ids, term_handle/term_handles, or term_id/term_ids."
             )
             continue
+
+        formula_ids = resolved_formula_ids
+        term_ids = resolved_term_ids
 
         if qid is not None:
             if qid not in existing_ids:
