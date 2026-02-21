@@ -835,7 +835,7 @@ def api_terms_export():
 
 @app.route('/api/terms/import', methods=['POST'])
 def api_terms_import():
-    """Bulk import terms from JSON (admin only). Match by term_handle when present (cross-env safe); else by term_id if it exists in target; else INSERT."""
+    """Bulk import terms from JSON (admin only). Match by term_handle only (cross-env safe); insert when handle is new."""
     claims, err = _require_admin()
     if err:
         return err
@@ -846,28 +846,25 @@ def api_terms_import():
     if not isinstance(items, list):
         return jsonify({"error": "terms array required"}), 400
 
-    seen_ids = set()
+    seen_handles = set()
     for i, row in enumerate(items):
         if not isinstance(row, dict):
             return jsonify({
                 "error": "Invalid file format.",
                 "details": [f"Record {i + 1} is not a valid object. Each term must be a JSON object with term_name and definition."]
             }), 400
-        tid = row.get("term_id") or row.get("id")
-        if tid is not None:
-            try:
-                tid = int(tid)
-            except (TypeError, ValueError):
-                return jsonify({
-                    "error": "Invalid term_id.",
-                    "details": [f"Record {i + 1} has an invalid term_id. It must be a number, or omit the field to create a new record."]
-                }), 400
-            if tid in seen_ids:
-                return jsonify({
-                    "error": "Duplicate term_id.",
-                    "details": [f"Record {i + 1} uses term_id {tid}, which appears more than once."]
-                }), 400
-            seen_ids.add(tid)
+        th = (str(row.get("term_handle") or row.get("handle") or "")).strip().lower()
+        if not th:
+            return jsonify({
+                "error": "Missing term_handle.",
+                "details": [f"Record {i + 1} is missing term_handle. Imports key on handles only; each term must include a unique term_handle."]
+            }), 400
+        if th in seen_handles:
+            return jsonify({
+                "error": "Duplicate term_handle.",
+                "details": [f"Record {i + 1} uses term_handle \"{th}\" more than once."]
+            }), 400
+        seen_handles.add(th)
 
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
@@ -892,9 +889,6 @@ def api_terms_import():
     used_term_handles = {h for h in handle_to_term_id.keys()}
 
     for i, row in enumerate(items):
-        tid = row.get("term_id") or row.get("id")
-        if tid is not None:
-            tid = int(tid)
         term_handle_raw = (str(row.get("term_handle") or row.get("handle") or "")).strip()
         name = (str(row.get("term_name") or row.get("name") or "")).strip()
         definition = (str(row.get("definition") or "")).strip()
@@ -926,15 +920,11 @@ def api_terms_import():
         if not definition:
             errors.append(f"Record {i + 1} (\"{name}\"): Missing definition.")
             continue
-        # For cross-env import: term_id from source may not exist in target. Match by term_handle instead.
-        # Only error if we have tid, it doesn't exist, AND we have no way to match (no handle, and would need to update).
-        # In practice we match by handle when present, or INSERT when new - so we allow tid from source to be ignored.
+        if not term_handle_raw:
+            errors.append(f"Record {i + 1} (\"{name}\"): Missing term_handle.")
+            continue
 
-        match_tid = None
-        if tid is not None and tid in existing_ids:
-            match_tid = tid
-        elif term_handle_raw:
-            match_tid = handle_to_term_id.get(term_handle_raw.lower())
+        match_tid = handle_to_term_id.get(term_handle_raw.lower())
 
         if match_tid is not None:
             try:
@@ -956,7 +946,7 @@ def api_terms_import():
                 conn.close()
                 return jsonify({"error": str(e)}), 400
         else:
-            base = (term_handle_raw or _slugify(name) or f"term_{i + 1}").lower()
+            base = term_handle_raw.lower()
             th = base
             n = 2
             while th in used_term_handles:
@@ -1412,7 +1402,7 @@ def api_formulas_export():
 
 @app.route('/api/formulas/import', methods=['POST'])
 def api_formulas_import():
-    """Bulk import formulas from JSON (admin only). Match by formula_handle when present (cross-env safe); else by formula_id if it exists in target; else INSERT."""
+    """Bulk import formulas from JSON (admin only). Match by formula_handle only (cross-env safe); insert when handle is new."""
     claims, err = _require_admin()
     if err:
         return err
@@ -1423,28 +1413,25 @@ def api_formulas_import():
     if not isinstance(items, list):
         return jsonify({"error": "formulas array required"}), 400
 
-    seen_ids = set()
+    seen_handles = set()
     for i, row in enumerate(items):
         if not isinstance(row, dict):
             return jsonify({
                 "error": "Invalid file format.",
                 "details": [f"Record {i + 1} is not a valid object. Each formula must have formula_name and latex."]
             }), 400
-        fid = row.get("formula_id") or row.get("id")
-        if fid is not None:
-            try:
-                fid = int(fid)
-            except (TypeError, ValueError):
-                return jsonify({
-                    "error": "Invalid formula_id.",
-                    "details": [f"Record {i + 1} has an invalid formula_id. Omit to create a new record."]
-                }), 400
-            if fid in seen_ids:
-                return jsonify({
-                    "error": "Duplicate formula_id.",
-                    "details": [f"Record {i + 1} uses formula_id {fid} more than once."]
-                }), 400
-            seen_ids.add(fid)
+        fh = (str(row.get("formula_handle") or row.get("handle") or "")).strip().lower()
+        if not fh:
+            return jsonify({
+                "error": "Missing formula_handle.",
+                "details": [f"Record {i + 1} is missing formula_handle. Imports key on handles only; each formula must include a unique formula_handle."]
+            }), 400
+        if fh in seen_handles:
+            return jsonify({
+                "error": "Duplicate formula_handle.",
+                "details": [f"Record {i + 1} uses formula_handle \"{fh}\" more than once."]
+            }), 400
+        seen_handles.add(fh)
 
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
@@ -1471,9 +1458,6 @@ def api_formulas_import():
         return None if v is None or v == "" else (str(v).strip() or None)
 
     for i, row in enumerate(items):
-        fid = row.get("formula_id") or row.get("id")
-        if fid is not None:
-            fid = int(fid)
         formula_handle_raw = (str(row.get("formula_handle") or row.get("handle") or "")).strip()
         name = (str(row.get("formula_name") or row.get("name") or "")).strip()
         latex = (str(row.get("latex") or "")).strip()
@@ -1506,12 +1490,11 @@ def api_formulas_import():
         if not latex:
             errors.append(f"Record {i + 1} (\"{name}\"): Missing latex.")
             continue
+        if not formula_handle_raw:
+            errors.append(f"Record {i + 1} (\"{name}\"): Missing formula_handle.")
+            continue
 
-        match_fid = None
-        if fid is not None and fid in existing_ids:
-            match_fid = fid
-        elif formula_handle_raw:
-            match_fid = handle_to_formula_id.get(formula_handle_raw.lower())
+        match_fid = handle_to_formula_id.get(formula_handle_raw.lower())
 
         if match_fid is not None:
             try:
@@ -1534,7 +1517,7 @@ def api_formulas_import():
                 conn.close()
                 return jsonify({"error": str(e)}), 400
         else:
-            base = (formula_handle_raw or _slugify(name) or f"formula_{i + 1}").lower()
+            base = formula_handle_raw.lower()
             fh = base
             n = 2
             while fh in used_formula_handles:
@@ -1796,14 +1779,14 @@ def api_questions_export():
             conn.close()
             return jsonify({"exported_at": __import__("datetime").datetime.utcnow().isoformat() + "Z", "questions": []})
         cur.execute("""
-            SELECT q.question_id, q.question_type, q.stem, q.explanation, q.display_order
+            SELECT q.question_id, q.question_handle, q.question_type, q.stem, q.explanation, q.display_order
             FROM tbl_question q
             WHERE q.parent_question_id IS NULL AND q.question_id = ANY(%s)
             ORDER BY q.display_order, q.question_id;
         """, (list(question_ids),))
     else:
         cur.execute("""
-            SELECT q.question_id, q.question_type, q.stem, q.explanation, q.display_order
+            SELECT q.question_id, q.question_handle, q.question_type, q.stem, q.explanation, q.display_order
             FROM tbl_question q
             WHERE q.parent_question_id IS NULL
             ORDER BY q.display_order, q.question_id;
@@ -1823,7 +1806,7 @@ def api_questions_export():
     formula_id_to_handle = {r[0]: r[1] for r in cur.fetchall()}
     questions_out = []
     for r in rows:
-        qid, qtype, stem, explanation, display_order = r
+        qid, qhandle, qtype, stem, explanation, display_order = r
         cur.execute("""
             SELECT a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
             FROM tbl_question_answer qa
@@ -1839,6 +1822,7 @@ def api_questions_export():
         tids = term_links.get(qid, [])
         item = {
             "question_id": qid,
+            "question_handle": qhandle,
             "question_type": qtype,
             "stem": stem or "",
             "explanation": explanation or "",
@@ -1851,14 +1835,14 @@ def api_questions_export():
         }
         if qtype == "multipart":
             cur.execute("""
-                SELECT question_id, part_label, stem, display_order
+                SELECT question_id, question_handle, part_label, stem, display_order
                 FROM tbl_question
                 WHERE parent_question_id = %s
                 ORDER BY display_order, question_id;
             """, (qid,))
             parts = []
             for pr in cur.fetchall():
-                pid, plabel, pstem, pord = pr
+                pid, phandle, plabel, pstem, pord = pr
                 cur.execute("""
                     SELECT a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
                     FROM tbl_question_answer qa
@@ -1870,7 +1854,7 @@ def api_questions_export():
                     {"answer_text": row[0] or "", "answer_numeric": float(row[1]) if row[1] is not None else None, "is_correct": row[2], "display_order": row[3]}
                     for row in cur.fetchall()
                 ]
-                parts.append({"question_id": pid, "part_label": plabel or "", "stem": pstem or "", "display_order": pord, "answers": part_answers})
+                parts.append({"question_id": pid, "question_handle": phandle, "part_label": plabel or "", "stem": pstem or "", "display_order": pord, "answers": part_answers})
             item["parts"] = parts
         questions_out.append(item)
     cur.close()
@@ -1880,7 +1864,7 @@ def api_questions_export():
 
 @app.route('/api/questions/import', methods=['POST'])
 def api_questions_import():
-    """Bulk import questions with answers from JSON (admin only). Existing question_id in target → update; otherwise insert. Formula/term links resolve by handles when provided (cross-env safe)."""
+    """Bulk import questions with answers from JSON (admin only). Match by question_handle only (cross-env safe); insert when handle is new."""
     claims, err = _require_admin()
     if err:
         return err
@@ -1891,34 +1875,39 @@ def api_questions_import():
     if not isinstance(items, list):
         return jsonify({"error": "questions array required"}), 400
 
-    seen_ids = set()
+    seen_handles = set()
     for i, row in enumerate(items):
         if not isinstance(row, dict):
             return jsonify({
                 "error": "Invalid file format.",
                 "details": [f"Record {i + 1} is not a valid object. Each question must have question_type and stem."]
             }), 400
-        qid = row.get("question_id") or row.get("id")
-        if qid is not None:
-            try:
-                qid = int(qid)
-            except (TypeError, ValueError):
-                return jsonify({
-                    "error": "Invalid question_id.",
-                    "details": [f"Record {i + 1} has an invalid question_id. Omit to create a new record."]
-                }), 400
-            if qid in seen_ids:
-                return jsonify({
-                    "error": "Duplicate question_id.",
-                    "details": [f"Record {i + 1} uses question_id {qid} more than once."]
-                }), 400
-            seen_ids.add(qid)
+        qh = (str(row.get("question_handle") or row.get("handle") or "")).strip().lower()
+        if not qh:
+            return jsonify({
+                "error": "Missing question_handle.",
+                "details": [f"Record {i + 1} is missing question_handle. Imports key on handles only; each question must include a unique question_handle."]
+            }), 400
+        if qh in seen_handles:
+            return jsonify({
+                "error": "Duplicate question_handle.",
+                "details": [f"Record {i + 1} uses question_handle \"{qh}\" more than once."]
+            }), 400
+        seen_handles.add(qh)
 
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
-    cur.execute("SELECT question_id FROM tbl_question;")
-    existing_ids = {r[0] for r in cur.fetchall()}
+    cur.execute("SELECT question_id, question_handle FROM tbl_question;")
+    question_rows = cur.fetchall()
+    existing_ids = {r[0] for r in question_rows}
+    question_handle_to_id = {}
+    used_question_handles = set()
+    for qid_db, h in question_rows:
+        if h and str(h).strip():
+            hk = str(h).strip().lower()
+            question_handle_to_id[hk] = qid_db
+            used_question_handles.add(hk)
     cur.execute("SELECT formula_id, formula_handle FROM tbl_formula;")
     formula_rows = cur.fetchall()
     existing_formula_ids = {r[0] for r in formula_rows}
@@ -1937,6 +1926,16 @@ def api_questions_import():
     inserted = 0
     updated = 0
     errors = []
+
+    def _claim_question_handle(raw_handle, fallback_base, fallback_prefix):
+        base = (str(raw_handle or "").strip().lower() or _slugify(fallback_base) or fallback_prefix).lower()
+        handle = base
+        n = 2
+        while handle in used_question_handles:
+            handle = f"{base}_{n}"
+            n += 1
+        used_question_handles.add(handle)
+        return handle
 
     def _upsert_question_answers(cur, question_id, answers):
         cur.execute("DELETE FROM tbl_question_answer WHERE question_id = %s;", (question_id,))
@@ -1977,9 +1976,7 @@ def api_questions_import():
                 pass
 
     for i, row in enumerate(items):
-        qid = row.get("question_id") or row.get("id")
-        if qid is not None:
-            qid = int(qid)
+        question_handle_raw = (str(row.get("question_handle") or row.get("handle") or "")).strip()
         qtype = (str(row.get("question_type") or "")).strip()
         stem = (str(row.get("stem") or "")).strip()
         explanation = row.get("explanation")
@@ -2032,12 +2029,6 @@ def api_questions_import():
                         break
             if skip_row:
                 continue
-        else:
-            try:
-                resolved_formula_ids = [int(x) for x in formula_ids if x is not None and str(x).strip() != ""]
-            except (TypeError, ValueError):
-                resolved_formula_ids = []
-            resolved_formula_ids = [f for f in resolved_formula_ids if f in existing_formula_ids]
 
         resolved_term_ids = []
         if term_handles:
@@ -2053,12 +2044,6 @@ def api_questions_import():
                         break
             if skip_row:
                 continue
-        else:
-            try:
-                resolved_term_ids = [int(x) for x in term_ids if x is not None and str(x).strip() != ""]
-            except (TypeError, ValueError):
-                resolved_term_ids = []
-            resolved_term_ids = [t for t in resolved_term_ids if t in existing_term_ids]
 
         if qtype not in ("multiple_choice", "true_false", "word_problem", "multipart"):
             errors.append(f"Record {i + 1}: question_type must be one of: multiple_choice, true_false, word_problem, multipart.")
@@ -2068,35 +2053,39 @@ def api_questions_import():
             continue
         if len(resolved_formula_ids) == 0 and len(resolved_term_ids) == 0:
             errors.append(
-                f"Record {i + 1}: Missing link. Include at least one formula_handle/formula_handles, formula_id/formula_ids, term_handle/term_handles, or term_id/term_ids."
+                f"Record {i + 1}: Missing link. Include at least one formula_handle/formula_handles or term_handle/term_handles."
             )
             continue
 
         formula_ids = resolved_formula_ids
         term_ids = resolved_term_ids
 
-        # Cross-env import: source question_id may not exist in target DB.
-        # Treat unknown IDs as new records instead of failing the entire row.
-        if qid is not None and qid not in existing_ids:
-            qid = None
+        if not question_handle_raw:
+            errors.append(f"Record {i + 1}: Missing question_handle.")
+            continue
+
+        qh_key = question_handle_raw.lower()
+        qid = question_handle_to_id.get(qh_key)
 
         if qid is not None:
             try:
                 cur.execute(
-                    "UPDATE tbl_question SET question_type = %s, stem = %s, explanation = %s, display_order = %s, updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
-                    (qtype, stem, explanation, display_order, qid),
+                    "UPDATE tbl_question SET question_type = %s, stem = %s, explanation = %s, display_order = %s, question_handle = COALESCE(NULLIF(TRIM(%s), ''), question_handle), updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
+                    (qtype, stem, explanation, display_order, question_handle_raw or None, qid),
                 )
                 updated += 1
                 _upsert_question_answers(cur, qid, row.get("answers"))
                 if qtype == "multipart":
                     parts = row.get("parts") or []
-                    cur.execute("SELECT question_id FROM tbl_question WHERE parent_question_id = %s;", (qid,))
-                    existing_parts = {r[0] for r in cur.fetchall()}
+                    cur.execute("SELECT question_id, question_handle FROM tbl_question WHERE parent_question_id = %s;", (qid,))
+                    existing_parts_by_handle = {}
+                    for part_qid, part_h in cur.fetchall():
+                        if part_h and str(part_h).strip():
+                            existing_parts_by_handle[str(part_h).strip().lower()] = part_qid
                     for pi, p in enumerate(parts):
                         if not isinstance(p, dict):
                             continue
-                        pid = p.get("question_id") or p.get("id")
-                        pid = int(pid) if pid is not None else None
+                        part_handle_raw = (str(p.get("question_handle") or p.get("handle") or "")).strip()
                         plabel = (str(p.get("part_label") or "")).strip() or None
                         pstem = (str(p.get("stem") or "")).strip()
                         pord = p.get("display_order")
@@ -2104,18 +2093,26 @@ def api_questions_import():
                             pord = int(pord) if pord is not None else pi
                         except (TypeError, ValueError):
                             pord = pi
-                        if pid is not None and pid in existing_parts:
+                        if not part_handle_raw:
+                            errors.append(f"Record {i + 1}: multipart part {pi + 1} is missing question_handle.")
+                            continue
+                        part_key = part_handle_raw.lower()
+                        pid = existing_parts_by_handle.get(part_key)
+                        if pid is not None:
                             cur.execute(
-                                "UPDATE tbl_question SET part_label = %s, stem = %s, display_order = %s, updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
-                                (plabel, pstem, pord, pid),
+                                "UPDATE tbl_question SET part_label = %s, stem = %s, display_order = %s, question_handle = COALESCE(NULLIF(TRIM(%s), ''), question_handle), updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
+                                (plabel, pstem, pord, part_handle_raw or None, pid),
                             )
                             _upsert_question_answers(cur, pid, p.get("answers"))
                         else:
+                            ph = _claim_question_handle(part_handle_raw, f"{stem}_{pi + 1}", f"question_part_{i + 1}_{pi + 1}")
                             cur.execute(
-                                "INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order) VALUES ('multipart', %s, %s, %s, %s) RETURNING question_id;",
-                                (pstem, qid, plabel, pord),
+                                "INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order, question_handle) VALUES ('multipart', %s, %s, %s, %s, %s) RETURNING question_id;",
+                                (pstem, qid, plabel, pord, ph),
                             )
                             new_pid = cur.fetchone()[0]
+                            existing_ids.add(new_pid)
+                            question_handle_to_id[ph] = new_pid
                             _upsert_question_answers(cur, new_pid, p.get("answers"))
                 _set_formula_term_links(cur, qid, formula_ids, term_ids)
             except psycopg2.IntegrityError as e:
@@ -2125,12 +2122,14 @@ def api_questions_import():
                 return jsonify({"error": str(e)}), 400
         else:
             try:
+                qh = _claim_question_handle(question_handle_raw, stem, f"question_{i + 1}")
                 cur.execute(
-                    "INSERT INTO tbl_question (question_type, stem, explanation, display_order) VALUES (%s, %s, %s, %s) RETURNING question_id;",
-                    (qtype, stem, explanation, display_order),
+                    "INSERT INTO tbl_question (question_type, stem, explanation, display_order, question_handle) VALUES (%s, %s, %s, %s, %s) RETURNING question_id;",
+                    (qtype, stem, explanation, display_order, qh),
                 )
                 new_id = cur.fetchone()[0]
                 existing_ids.add(new_id)
+                question_handle_to_id[qh] = new_id
                 inserted += 1
                 _upsert_question_answers(cur, new_id, row.get("answers"))
                 if qtype == "multipart":
@@ -2138,6 +2137,7 @@ def api_questions_import():
                     for pi, p in enumerate(parts):
                         if not isinstance(p, dict):
                             continue
+                        part_handle_raw = (str(p.get("question_handle") or p.get("handle") or "")).strip()
                         plabel = (str(p.get("part_label") or "")).strip() or None
                         pstem = (str(p.get("stem") or "")).strip()
                         pord = p.get("display_order")
@@ -2145,11 +2145,17 @@ def api_questions_import():
                             pord = int(pord) if pord is not None else pi
                         except (TypeError, ValueError):
                             pord = pi
+                        if not part_handle_raw:
+                            errors.append(f"Record {i + 1}: multipart part {pi + 1} is missing question_handle.")
+                            continue
+                        ph = _claim_question_handle(part_handle_raw, f"{stem}_{pi + 1}", f"question_part_{i + 1}_{pi + 1}")
                         cur.execute(
-                            "INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order) VALUES ('multipart', %s, %s, %s, %s) RETURNING question_id;",
-                            (pstem, new_id, plabel, pord),
+                            "INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order, question_handle) VALUES ('multipart', %s, %s, %s, %s, %s) RETURNING question_id;",
+                            (pstem, new_id, plabel, pord, ph),
                         )
                         part_id = cur.fetchone()[0]
+                        existing_ids.add(part_id)
+                        question_handle_to_id[ph] = part_id
                         _upsert_question_answers(cur, part_id, p.get("answers"))
                 _set_formula_term_links(cur, new_id, formula_ids, term_ids)
             except psycopg2.IntegrityError as e:
@@ -2183,7 +2189,7 @@ def api_question_get(question_id):
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
     cur.execute("""
-        SELECT question_id, question_type, stem, explanation, display_order
+        SELECT question_id, question_handle, question_type, stem, explanation, display_order
         FROM tbl_question WHERE question_id = %s AND parent_question_id IS NULL;
     """, (question_id,))
     row = cur.fetchone()
@@ -2191,7 +2197,7 @@ def api_question_get(question_id):
         cur.close()
         conn.close()
         return jsonify({"error": "Question not found"}), 404
-    qid, qtype, stem, explanation, display_order = row
+    qid, qhandle, qtype, stem, explanation, display_order = row
     cur.execute("""
         SELECT a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
         FROM tbl_question_answer qa
@@ -2209,6 +2215,7 @@ def api_question_get(question_id):
     term_ids = [r[0] for r in cur.fetchall()]
     item = {
         "question_id": qid,
+        "question_handle": qhandle,
         "question_type": qtype,
         "stem": stem or "",
         "explanation": explanation or "",
@@ -2219,14 +2226,14 @@ def api_question_get(question_id):
     }
     if qtype == "multipart":
         cur.execute("""
-            SELECT question_id, part_label, stem, display_order
+            SELECT question_id, question_handle, part_label, stem, display_order
             FROM tbl_question
             WHERE parent_question_id = %s
             ORDER BY display_order, question_id;
         """, (qid,))
         parts = []
         for pr in cur.fetchall():
-            pid, plabel, pstem, pord = pr
+            pid, phandle, plabel, pstem, pord = pr
             cur.execute("""
                 SELECT a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
                 FROM tbl_question_answer qa
@@ -2238,7 +2245,7 @@ def api_question_get(question_id):
                 {"answer_text": r[0] or "", "answer_numeric": float(r[1]) if r[1] is not None else None, "is_correct": r[2], "display_order": r[3]}
                 for r in cur.fetchall()
             ]
-            parts.append({"question_id": pid, "part_label": plabel or "", "stem": pstem or "", "display_order": pord, "answers": part_answers})
+            parts.append({"question_id": pid, "question_handle": phandle, "part_label": plabel or "", "stem": pstem or "", "display_order": pord, "answers": part_answers})
         item["parts"] = parts
     cur.close()
     conn.close()
@@ -2262,6 +2269,7 @@ def api_question_update(question_id):
         cur.close()
         conn.close()
         return jsonify({"error": "Question not found"}), 404
+    question_handle_raw = (str(data.get("question_handle") or data.get("handle") or "")).strip() or None
     qtype = (str(data.get("question_type") or "")).strip()
     stem = (str(data.get("stem") or "")).strip()
     explanation = data.get("explanation")
@@ -2282,9 +2290,22 @@ def api_question_update(question_id):
         conn.close()
         return jsonify({"error": "stem is required"}), 400
     try:
+        cur.execute("SELECT question_handle FROM tbl_question WHERE question_handle IS NOT NULL AND question_handle != '';")
+        used_question_handles = {str(r[0]).strip().lower() for r in cur.fetchall() if r[0]}
+
+        def _claim_question_handle(raw_handle, fallback_base, fallback_prefix):
+            base = (str(raw_handle or "").strip().lower() or _slugify(fallback_base) or fallback_prefix).lower()
+            handle = base
+            n = 2
+            while handle in used_question_handles:
+                handle = f"{base}_{n}"
+                n += 1
+            used_question_handles.add(handle)
+            return handle
+
         cur.execute(
-            "UPDATE tbl_question SET question_type = %s, stem = %s, explanation = %s, display_order = %s, updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
-            (qtype, stem, explanation, display_order, question_id),
+            "UPDATE tbl_question SET question_type = %s, stem = %s, explanation = %s, display_order = %s, question_handle = COALESCE(NULLIF(TRIM(%s), ''), question_handle), updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
+            (qtype, stem, explanation, display_order, question_handle_raw, question_id),
         )
         cur.execute("SELECT formula_id FROM tbl_formula;")
         existing_formula_ids = {r[0] for r in cur.fetchall()}
@@ -2340,6 +2361,7 @@ def api_question_update(question_id):
                     continue
                 pid = p.get("question_id") or p.get("id")
                 pid = int(pid) if pid is not None else None
+                part_handle_raw = (str(p.get("question_handle") or p.get("handle") or "")).strip() or None
                 plabel = (str(p.get("part_label") or "")).strip() or None
                 pstem = (str(p.get("stem") or "")).strip()
                 pord = p.get("display_order")
@@ -2350,14 +2372,15 @@ def api_question_update(question_id):
                 if pid is not None and pid in existing_parts:
                     kept_part_ids.add(pid)
                     cur.execute(
-                        "UPDATE tbl_question SET part_label = %s, stem = %s, display_order = %s, updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
-                        (plabel, pstem, pord, pid),
+                        "UPDATE tbl_question SET part_label = %s, stem = %s, display_order = %s, question_handle = COALESCE(NULLIF(TRIM(%s), ''), question_handle), updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
+                        (plabel, pstem, pord, part_handle_raw, pid),
                     )
                     _upsert_answers(cur, pid, p.get("answers"))
                 else:
+                    ph = _claim_question_handle(part_handle_raw, f"{stem}_{pi + 1}", f"question_part_patch_{question_id}_{pi + 1}")
                     cur.execute(
-                        "INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order) VALUES ('multipart', %s, %s, %s, %s) RETURNING question_id;",
-                        (pstem, question_id, plabel, pord),
+                        "INSERT INTO tbl_question (question_type, stem, parent_question_id, part_label, display_order, question_handle) VALUES ('multipart', %s, %s, %s, %s, %s) RETURNING question_id;",
+                        (pstem, question_id, plabel, pord, ph),
                     )
                     new_pid = cur.fetchone()[0]
                     _upsert_answers(cur, new_pid, p.get("answers"))
