@@ -1412,7 +1412,7 @@ def api_formulas_export():
 
 @app.route('/api/formulas/import', methods=['POST'])
 def api_formulas_import():
-    """Bulk import formulas from JSON (admin only). Existing IDs are updated; new records (null/absent id) are inserted."""
+    """Bulk import formulas from JSON (admin only). Match by formula_handle when present (cross-env safe); else by formula_id if it exists in target; else INSERT."""
     claims, err = _require_admin()
     if err:
         return err
@@ -1505,9 +1505,6 @@ def api_formulas_import():
             continue
         if not latex:
             errors.append(f"Record {i + 1} (\"{name}\"): Missing latex.")
-            continue
-        if fid is not None and fid not in existing_ids:
-            errors.append(f"Record {i + 1} (\"{name}\"): formula_id {fid} does not exist. Omit formula_id or use formula_handle to match.")
             continue
 
         match_fid = None
@@ -1883,7 +1880,7 @@ def api_questions_export():
 
 @app.route('/api/questions/import', methods=['POST'])
 def api_questions_import():
-    """Bulk import questions with answers from JSON (admin only). Existing question_id → update; null/absent → insert."""
+    """Bulk import questions with answers from JSON (admin only). Existing question_id in target → update; otherwise insert. Formula/term links resolve by handles when provided (cross-env safe)."""
     claims, err = _require_admin()
     if err:
         return err
@@ -2078,10 +2075,12 @@ def api_questions_import():
         formula_ids = resolved_formula_ids
         term_ids = resolved_term_ids
 
+        # Cross-env import: source question_id may not exist in target DB.
+        # Treat unknown IDs as new records instead of failing the entire row.
+        if qid is not None and qid not in existing_ids:
+            qid = None
+
         if qid is not None:
-            if qid not in existing_ids:
-                errors.append(f"Record {i + 1}: question_id {qid} does not exist. Omit to create a new question.")
-                continue
             try:
                 cur.execute(
                     "UPDATE tbl_question SET question_type = %s, stem = %s, explanation = %s, display_order = %s, updated_at = CURRENT_TIMESTAMP WHERE question_id = %s;",
