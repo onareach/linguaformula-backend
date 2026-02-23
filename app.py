@@ -2105,6 +2105,12 @@ def api_questions_import():
             if skip_row:
                 continue
 
+        if len(resolved_formula_ids) > 0 and len(resolved_term_ids) > 0:
+            errors.append(
+                f"Record {i + 1}: Invalid link. Provide formula_handle/formula_handles OR term_handle/term_handles, not both."
+            )
+            continue
+
         if qtype not in ("multiple_choice", "true_false", "word_problem", "multipart"):
             errors.append(f"Record {i + 1}: question_type must be one of: multiple_choice, true_false, word_problem, multipart.")
             continue
@@ -2113,7 +2119,7 @@ def api_questions_import():
             continue
         if len(resolved_formula_ids) == 0 and len(resolved_term_ids) == 0:
             errors.append(
-                f"Record {i + 1}: Missing link. Include at least one formula_handle/formula_handles or term_handle/term_handles."
+                f"Record {i + 1}: Missing link. Include at least one formula_handle/formula_handles or term_handle/term_handles that matches this database."
             )
             continue
 
