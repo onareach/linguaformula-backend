@@ -1053,21 +1053,51 @@ def fetch_term_questions(term_id):
 
 @app.route('/api/terms/<int:term_id>', methods=['DELETE'])
 def api_term_delete(term_id):
-    """Delete a term (admin only). Cascades to tbl_term_discipline, tbl_term_question."""
+    """Delete a term (admin only) and any questions linked to it."""
     claims, err = _require_admin()
     if err:
         return err
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
-    cur.execute("DELETE FROM tbl_term WHERE term_id = %s RETURNING term_id;", (term_id,))
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-    if deleted == 0:
-        return jsonify({"error": "Term not found"}), 404
-    return jsonify({"message": "Term deleted"}), 200
+    try:
+        cur.execute("SELECT term_id FROM tbl_term WHERE term_id = %s;", (term_id,))
+        if cur.fetchone() is None:
+            return jsonify({"error": "Term not found"}), 404
+
+        cur.execute("""
+            SELECT DISTINCT q.question_id
+            FROM tbl_question q
+            INNER JOIN tbl_term_question tq ON tq.question_id = q.question_id
+            WHERE tq.term_id = %s AND q.parent_question_id IS NULL;
+        """, (term_id,))
+        question_ids = [r[0] for r in cur.fetchall()]
+
+        deleted_questions = 0
+        if question_ids:
+            cur.execute(
+                "DELETE FROM tbl_question WHERE question_id = ANY(%s) RETURNING question_id;",
+                (question_ids,)
+            )
+            deleted_questions = cur.rowcount
+
+        cur.execute("DELETE FROM tbl_term WHERE term_id = %s RETURNING term_id;", (term_id,))
+        deleted_term = cur.rowcount
+        if deleted_term == 0:
+            conn.rollback()
+            return jsonify({"error": "Term not found"}), 404
+
+        conn.commit()
+        return jsonify({
+            "message": "Term deleted",
+            "deleted_questions": deleted_questions
+        }), 200
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 
 @app.route('/api/terms/<int:term_id>', methods=['PATCH'])
@@ -1607,21 +1637,51 @@ def fetch_formulas_with_questions():
 
 @app.route('/api/formulas/<int:formula_id>', methods=['DELETE'])
 def api_formula_delete(formula_id):
-    """Delete a formula (admin only). Cascades to related tables."""
+    """Delete a formula (admin only) and any questions linked to it."""
     claims, err = _require_admin()
     if err:
         return err
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
-    cur.execute("DELETE FROM tbl_formula WHERE formula_id = %s RETURNING formula_id;", (formula_id,))
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
-    if deleted == 0:
-        return jsonify({"error": "Formula not found"}), 404
-    return jsonify({"message": "Formula deleted"}), 200
+    try:
+        cur.execute("SELECT formula_id FROM tbl_formula WHERE formula_id = %s;", (formula_id,))
+        if cur.fetchone() is None:
+            return jsonify({"error": "Formula not found"}), 404
+
+        cur.execute("""
+            SELECT DISTINCT q.question_id
+            FROM tbl_question q
+            INNER JOIN tbl_formula_question fq ON fq.question_id = q.question_id
+            WHERE fq.formula_id = %s AND q.parent_question_id IS NULL;
+        """, (formula_id,))
+        question_ids = [r[0] for r in cur.fetchall()]
+
+        deleted_questions = 0
+        if question_ids:
+            cur.execute(
+                "DELETE FROM tbl_question WHERE question_id = ANY(%s) RETURNING question_id;",
+                (question_ids,)
+            )
+            deleted_questions = cur.rowcount
+
+        cur.execute("DELETE FROM tbl_formula WHERE formula_id = %s RETURNING formula_id;", (formula_id,))
+        deleted_formula = cur.rowcount
+        if deleted_formula == 0:
+            conn.rollback()
+            return jsonify({"error": "Formula not found"}), 404
+
+        conn.commit()
+        return jsonify({
+            "message": "Formula deleted",
+            "deleted_questions": deleted_questions
+        }), 200
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        conn.close()
 
 
 @app.route('/api/formulas/<int:formula_id>', methods=['PATCH'])
