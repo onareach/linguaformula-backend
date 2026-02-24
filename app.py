@@ -3118,9 +3118,14 @@ def api_course_questions(course_id):
         cur.close()
         conn.close()
         all_questions = []
+        seen_question_ids = set()
         for fid in formula_ids:
             qs = get_questions_by_formula_id(fid)
             for q in qs:
+                qid = q.get("question_id")
+                if qid in seen_question_ids:
+                    continue
+                seen_question_ids.add(qid)
                 q["formula_id"] = fid
                 all_questions.append(q)
         return jsonify({
@@ -3492,9 +3497,14 @@ def api_course_term_questions(course_id):
         cur.close()
         conn.close()
         all_questions = []
+        seen_question_ids = set()
         for tid in term_ids:
             qs = get_questions_by_term_id(tid)
             for q in qs:
+                qid = q.get("question_id")
+                if qid in seen_question_ids:
+                    continue
+                seen_question_ids.add(qid)
                 q["term_id"] = tid
                 all_questions.append(q)
         return jsonify({
