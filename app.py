@@ -670,6 +670,150 @@ def api_discipline_delete(discipline_id):
     return jsonify({"message": "Discipline deleted"}), 200
 
 
+@app.route('/api/topics', methods=['GET'])
+def api_topics_list():
+    """List topics (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT t.topic_id, t.topic_name, t.topic_handle,
+               (SELECT COUNT(*) FROM tbl_formula f WHERE f.topic_handle = t.topic_handle) AS formula_count,
+               (SELECT COUNT(*) FROM tbl_term tr WHERE tr.topic_handle = t.topic_handle) AS term_count
+        FROM tbl_topic t
+        ORDER BY t.topic_name;
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return jsonify([
+        {
+            "id": r[0],
+            "name": r[1],
+            "handle": r[2],
+            "formula_count": r[3],
+            "term_count": r[4],
+        }
+        for r in rows
+    ])
+
+
+@app.route('/api/topics', methods=['POST'])
+def api_topic_create():
+    """Create a topic (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    name = (str(data.get("topic_name") or data.get("name") or "")).strip()
+    if not name:
+        return jsonify({"error": "topic_name is required"}), 400
+    raw_handle = (str(data.get("topic_handle") or data.get("handle") or "")).strip()
+    handle = raw_handle.lower() if raw_handle else _slugify(name, 100)
+    if not handle:
+        return jsonify({"error": "topic_handle is required"}), 400
+    conn = _auth_db()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO tbl_topic (topic_name, topic_handle)
+            VALUES (%s, %s)
+            RETURNING topic_id;
+        """, (name, handle))
+        topic_id = cur.fetchone()[0]
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({"error": "topic_handle already exists"}), 400
+    cur.execute("SELECT topic_id, topic_name, topic_handle FROM tbl_topic WHERE topic_id = %s;", (topic_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return jsonify({"id": row[0], "name": row[1], "handle": row[2], "formula_count": 0, "term_count": 0}), 201
+
+
+@app.route('/api/topics/<int:topic_id>', methods=['PATCH'])
+def api_topic_update(topic_id):
+    """Update a topic (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    updates = {}
+    if "topic_name" in data or "name" in data:
+        s = (str(data.get("topic_name") or data.get("name") or "")).strip()
+        if not s:
+            return jsonify({"error": "topic_name cannot be empty"}), 400
+        updates["topic_name"] = s
+    if "topic_handle" in data or "handle" in data:
+        s = (str(data.get("topic_handle") or data.get("handle") or "")).strip().lower()
+        if not s:
+            return jsonify({"error": "topic_handle cannot be empty"}), 400
+        updates["topic_handle"] = s
+    if not updates:
+        return jsonify({"error": "No valid fields to update"}), 400
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM tbl_topic WHERE topic_id = %s;", (topic_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Topic not found"}), 404
+    try:
+        set_clause = ", ".join(f"{k} = %s" for k in updates) + ", updated_at = CURRENT_TIMESTAMP"
+        vals = [updates[k] for k in updates]
+        cur.execute(f"UPDATE tbl_topic SET {set_clause} WHERE topic_id = %s;", vals + [topic_id])
+        conn.commit()
+    except psycopg2.IntegrityError:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({"error": "topic_handle already exists"}), 400
+    cur.execute("""
+        SELECT t.topic_id, t.topic_name, t.topic_handle,
+               (SELECT COUNT(*) FROM tbl_formula f WHERE f.topic_handle = t.topic_handle) AS formula_count,
+               (SELECT COUNT(*) FROM tbl_term tr WHERE tr.topic_handle = t.topic_handle) AS term_count
+        FROM tbl_topic t
+        WHERE t.topic_id = %s;
+    """, (topic_id,))
+    row = cur.fetchone()
+    cur.close()
+    conn.close()
+    return jsonify({
+        "id": row[0],
+        "name": row[1],
+        "handle": row[2],
+        "formula_count": row[3],
+        "term_count": row[4],
+    }), 200
+
+
+@app.route('/api/topics/<int:topic_id>', methods=['DELETE'])
+def api_topic_delete(topic_id):
+    """Delete a topic (admin only). Topic links on terms/formulas become NULL via FK."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tbl_topic WHERE topic_id = %s RETURNING topic_id;", (topic_id,))
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+    if deleted == 0:
+        return jsonify({"error": "Topic not found"}), 404
+    return jsonify({"message": "Topic deleted"}), 200
+
+
 def get_terms():
     """Get all terms."""
     sslmode = "require" if DATABASE_URL.startswith("postgres://") else "disable"
@@ -802,7 +946,7 @@ def api_terms_export():
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cur = conn.cursor()
     cur.execute("""
-        SELECT t.term_id, t.term_name, t.definition, t.formulaic_expression, t.term_handle
+        SELECT t.term_id, t.term_name, t.definition, t.formulaic_expression, t.term_handle, t.topic_handle
         FROM tbl_term t
         ORDER BY t.term_name;
     """)
@@ -820,10 +964,11 @@ def api_terms_export():
         disc_by_term.setdefault(tid, []).append({"discipline_id": did, "discipline_handle": handle})
     terms = []
     for row in terms_rows:
-        tid, name, definition, formulaic_expr, term_handle = row
+        tid, name, definition, formulaic_expr, term_handle, topic_handle = row
         terms.append({
             "term_id": tid,
             "term_handle": term_handle or "",
+            "topic_handle": topic_handle or None,
             "term_name": name,
             "definition": definition or "",
             "formulaic_expression": formulaic_expr,
@@ -890,6 +1035,7 @@ def api_terms_import():
 
     for i, row in enumerate(items):
         term_handle_raw = (str(row.get("term_handle") or row.get("handle") or "")).strip()
+        topic_handle_raw = (str(row.get("topic_handle") or "")).strip().lower() or None
         name = (str(row.get("term_name") or row.get("name") or "")).strip()
         definition = (str(row.get("definition") or "")).strip()
         formulaic_expr = row.get("formulaic_expression")
@@ -930,9 +1076,10 @@ def api_terms_import():
             try:
                 cur.execute("""
                     UPDATE tbl_term SET term_name = %s, definition = %s, formulaic_expression = %s,
+                    topic_handle = %s,
                     term_handle = COALESCE(NULLIF(TRIM(%s), ''), term_handle),
                     updated_at = CURRENT_TIMESTAMP WHERE term_id = %s;
-                """, (name, definition, formulaic_expr, term_handle_raw or None, match_tid))
+                """, (name, definition, formulaic_expr, topic_handle_raw, term_handle_raw or None, match_tid))
                 updated += 1
                 cur.execute("DELETE FROM tbl_term_discipline WHERE term_id = %s;", (match_tid,))
                 for did in disc_ids:
@@ -955,9 +1102,9 @@ def api_terms_import():
             used_term_handles.add(th)
             try:
                 cur.execute("""
-                    INSERT INTO tbl_term (term_name, definition, formulaic_expression, term_handle)
-                    VALUES (%s, %s, %s, %s) RETURNING term_id;
-                """, (name, definition, formulaic_expr, th))
+                    INSERT INTO tbl_term (term_name, definition, formulaic_expression, term_handle, topic_handle)
+                    VALUES (%s, %s, %s, %s, %s) RETURNING term_id;
+                """, (name, definition, formulaic_expr, th, topic_handle_raw))
                 new_id = cur.fetchone()[0]
                 existing_ids.add(new_id)
                 handle_to_term_id[th.lower()] = new_id
@@ -1394,7 +1541,7 @@ def api_formulas_export():
     cur = conn.cursor()
     cur.execute("""
         SELECT formula_id, formula_name, latex, formula_description, english_verbalization,
-               symbolic_verbalization, units, example, historical_context, formula_handle
+               symbolic_verbalization, units, example, historical_context, formula_handle, topic_handle
         FROM tbl_formula
         ORDER BY formula_name;
     """)
@@ -1412,10 +1559,11 @@ def api_formulas_export():
         disc_by_formula.setdefault(fid, []).append({"discipline_id": did, "discipline_handle": handle})
     formulas = []
     for row in formulas_rows:
-        fid, name, latex, desc, eng_verb, sym_verb, units, example, hist, formula_handle = row
+        fid, name, latex, desc, eng_verb, sym_verb, units, example, hist, formula_handle, topic_handle = row
         formulas.append({
             "formula_id": fid,
             "formula_handle": formula_handle or "",
+            "topic_handle": topic_handle or None,
             "formula_name": name,
             "latex": latex or "",
             "formula_description": desc,
@@ -1489,6 +1637,7 @@ def api_formulas_import():
 
     for i, row in enumerate(items):
         formula_handle_raw = (str(row.get("formula_handle") or row.get("handle") or "")).strip()
+        topic_handle_raw = (str(row.get("topic_handle") or "")).strip().lower() or None
         name = (str(row.get("formula_name") or row.get("name") or "")).strip()
         latex = (str(row.get("latex") or "")).strip()
         desc = _opt(row.get("formula_description") or row.get("description"))
@@ -1531,9 +1680,10 @@ def api_formulas_import():
                 cur.execute("""
                     UPDATE tbl_formula SET formula_name = %s, latex = %s, formula_description = %s,
                     english_verbalization = %s, symbolic_verbalization = %s, units = %s, example = %s, historical_context = %s,
+                    topic_handle = %s,
                     formula_handle = COALESCE(NULLIF(TRIM(%s), ''), formula_handle),
                     updated_at = CURRENT_TIMESTAMP WHERE formula_id = %s;
-                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist, formula_handle_raw or None, match_fid))
+                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist, topic_handle_raw, formula_handle_raw or None, match_fid))
                 updated += 1
                 cur.execute("DELETE FROM tbl_formula_discipline WHERE formula_id = %s;", (match_fid,))
                 for did in disc_ids:
@@ -1557,9 +1707,9 @@ def api_formulas_import():
             try:
                 cur.execute("""
                     INSERT INTO tbl_formula (formula_name, latex, formula_description,
-                    english_verbalization, symbolic_verbalization, units, example, historical_context, formula_handle)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING formula_id;
-                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist, fh))
+                    english_verbalization, symbolic_verbalization, units, example, historical_context, formula_handle, topic_handle)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING formula_id;
+                """, (name, latex, desc, eng_verb, sym_verb, units, example, hist, fh, topic_handle_raw))
                 new_id = cur.fetchone()[0]
                 existing_ids.add(new_id)
                 handle_to_formula_id[fh] = new_id
@@ -3155,9 +3305,11 @@ def api_course_formulas_list(course_id):
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
         cur.execute("""
-            SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order, ucf.segment_label
+            SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order, ucf.segment_label,
+                   f.topic_handle, t.topic_name
             FROM tbl_user_course_formula ucf
             JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+            LEFT JOIN tbl_topic t ON t.topic_handle = f.topic_handle
             WHERE ucf.user_id = %s AND ucf.course_id = %s
             ORDER BY ucf.display_order NULLS LAST, f.formula_name;
         """, (user_id, course_id))
@@ -3166,7 +3318,15 @@ def api_course_formulas_list(course_id):
         conn.close()
         return jsonify({
             "formulas": [
-                {"id": r[0], "formula_name": r[1], "latex": r[2], "display_order": r[3], "segment": r[4]}
+                {
+                    "id": r[0],
+                    "formula_name": r[1],
+                    "latex": r[2],
+                    "display_order": r[3],
+                    "segment": r[4],
+                    "topic_handle": r[5],
+                    "topic_name": r[6],
+                }
                 for r in rows
             ]
         })
@@ -3339,9 +3499,11 @@ def api_course_terms_list(course_id):
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
         cur.execute("""
-            SELECT t.term_id, t.term_name, t.definition, uct.display_order, uct.segment_label
+            SELECT t.term_id, t.term_name, t.definition, uct.display_order, uct.segment_label,
+                   t.topic_handle, tp.topic_name
             FROM tbl_user_course_term uct
             JOIN tbl_term t ON t.term_id = uct.term_id
+            LEFT JOIN tbl_topic tp ON tp.topic_handle = t.topic_handle
             WHERE uct.user_id = %s AND uct.course_id = %s
             ORDER BY uct.display_order NULLS LAST, t.term_name;
         """, (user_id, course_id))
@@ -3350,7 +3512,15 @@ def api_course_terms_list(course_id):
         conn.close()
         return jsonify({
             "terms": [
-                {"term_id": r[0], "term_name": r[1], "definition": r[2], "display_order": r[3], "segment": r[4]}
+                {
+                    "term_id": r[0],
+                    "term_name": r[1],
+                    "definition": r[2],
+                    "display_order": r[3],
+                    "segment": r[4],
+                    "topic_handle": r[5],
+                    "topic_name": r[6],
+                }
                 for r in rows
             ]
         })
@@ -3461,6 +3631,192 @@ def api_course_term_remove(course_id, term_id):
         if deleted == 0:
             return jsonify({"error": "Term not linked to this course"}), 404
         return jsonify({"message": "Term removed from course"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/exam_sheet/compile', methods=['POST'])
+def api_exam_sheet_compile():
+    """Compile exam-sheet payload grouped by topic handle and item order."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        data = request.get_json() or {}
+        course_id = data.get("course_id")
+        if course_id is None:
+            return jsonify({"error": "course_id is required"}), 400
+        try:
+            course_id = int(course_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "course_id must be an integer"}), 400
+        segment = (str(data.get("segment") or "")).strip() or None
+        template_id = data.get("template_id")
+        if template_id is not None and template_id != "":
+            try:
+                template_id = int(template_id)
+            except (TypeError, ValueError):
+                return jsonify({"error": "template_id must be an integer when provided"}), 400
+        else:
+            template_id = None
+
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT c.course_name, c.course_code
+            FROM tbl_user_course uc
+            JOIN tbl_course c ON c.course_id = uc.course_id
+            WHERE uc.user_id = %s AND uc.course_id = %s;
+        """, (user_id, course_id))
+        course_row = cur.fetchone()
+        if course_row is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+
+        cur.execute("""
+            SELECT t.term_id, t.term_name, t.definition, uct.display_order,
+                   COALESCE(NULLIF(TRIM(t.topic_handle), ''), 'uncategorized') AS topic_handle,
+                   COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
+                   t.term_handle
+            FROM tbl_user_course_term uct
+            JOIN tbl_term t ON t.term_id = uct.term_id
+            LEFT JOIN tbl_topic tp ON tp.topic_handle = t.topic_handle
+            WHERE uct.user_id = %s
+              AND uct.course_id = %s
+              AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s))
+            ORDER BY uct.display_order NULLS LAST, t.term_name;
+        """, (user_id, course_id, segment, segment))
+        term_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order,
+                   COALESCE(NULLIF(TRIM(f.topic_handle), ''), 'uncategorized') AS topic_handle,
+                   COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
+                   f.formula_handle, f.example
+            FROM tbl_user_course_formula ucf
+            JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+            LEFT JOIN tbl_topic tp ON tp.topic_handle = f.topic_handle
+            WHERE ucf.user_id = %s
+              AND ucf.course_id = %s
+              AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s))
+            ORDER BY ucf.display_order NULLS LAST, f.formula_name;
+        """, (user_id, course_id, segment, segment))
+        formula_rows = cur.fetchall()
+
+        topic_order_map = {}
+        topic_include_map = {}
+        item_order_map = {}
+        item_include_map = {}
+        worked_example_map = {}
+        if template_id is not None:
+            cur.execute("""
+                SELECT topic_handle, topic_order, include_flag
+                FROM tbl_exam_sheet_template_topic
+                WHERE template_id = %s;
+            """, (template_id,))
+            for h, order_val, include_flag in cur.fetchall():
+                topic_order_map[h] = order_val if order_val is not None else 0
+                topic_include_map[h] = bool(include_flag)
+
+            cur.execute("""
+                SELECT item_type, item_handle, item_order, include_flag, worked_example_mode
+                FROM tbl_exam_sheet_template_item
+                WHERE template_id = %s;
+            """, (template_id,))
+            for item_type, item_handle, order_val, include_flag, wem in cur.fetchall():
+                key = (item_type, item_handle)
+                item_order_map[key] = order_val if order_val is not None else 0
+                item_include_map[key] = bool(include_flag)
+                worked_example_map[key] = wem
+
+        cur.close()
+        conn.close()
+
+        topics = {}
+
+        for row in term_rows:
+            term_id, term_name, definition, display_order, topic_handle, topic_name, term_handle = row
+            item_handle = term_handle or f"term_id_{term_id}"
+            key = ("term", item_handle)
+            if key in item_include_map and not item_include_map[key]:
+                continue
+            if topic_handle in topic_include_map and not topic_include_map[topic_handle]:
+                continue
+            bucket = topics.setdefault(topic_handle, {
+                "topic_handle": topic_handle,
+                "topic_name": topic_name,
+                "terms": [],
+                "formulas": [],
+            })
+            bucket["terms"].append({
+                "term_id": term_id,
+                "term_handle": term_handle,
+                "term_name": term_name,
+                "definition": definition,
+                "_sort_display_order": display_order if display_order is not None else 10**9,
+                "_sort_item_order": item_order_map.get(key),
+            })
+
+        for row in formula_rows:
+            formula_id, formula_name, latex, display_order, topic_handle, topic_name, formula_handle, example = row
+            item_handle = formula_handle or f"formula_id_{formula_id}"
+            key = ("formula", item_handle)
+            if key in item_include_map and not item_include_map[key]:
+                continue
+            if topic_handle in topic_include_map and not topic_include_map[topic_handle]:
+                continue
+            bucket = topics.setdefault(topic_handle, {
+                "topic_handle": topic_handle,
+                "topic_name": topic_name,
+                "terms": [],
+                "formulas": [],
+            })
+            mode = worked_example_map.get(key, "auto")
+            include_example = (mode == "always") or (mode == "auto" and bool((example or "").strip()))
+            bucket["formulas"].append({
+                "id": formula_id,
+                "formula_handle": formula_handle,
+                "formula_name": formula_name,
+                "latex": latex,
+                "example": example if include_example else None,
+                "worked_example_mode": mode,
+                "_sort_display_order": display_order if display_order is not None else 10**9,
+                "_sort_item_order": item_order_map.get(key),
+            })
+
+        topic_list = list(topics.values())
+        topic_list.sort(key=lambda t: (
+            topic_order_map.get(t["topic_handle"], 10**9),
+            t["topic_name"].lower(),
+        ))
+
+        for topic in topic_list:
+            topic["terms"].sort(key=lambda item: (
+                item["_sort_item_order"] if item["_sort_item_order"] is not None else 10**9,
+                item["_sort_display_order"],
+                item["term_name"].lower(),
+            ))
+            topic["formulas"].sort(key=lambda item: (
+                item["_sort_item_order"] if item["_sort_item_order"] is not None else 10**9,
+                item["_sort_display_order"],
+                item["formula_name"].lower(),
+            ))
+            for item in topic["terms"]:
+                item.pop("_sort_display_order", None)
+                item.pop("_sort_item_order", None)
+            for item in topic["formulas"]:
+                item.pop("_sort_display_order", None)
+                item.pop("_sort_item_order", None)
+
+        return jsonify({
+            "course_id": course_id,
+            "course_name": course_row[0],
+            "course_code": course_row[1],
+            "segment": segment,
+            "topics": topic_list,
+        })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
