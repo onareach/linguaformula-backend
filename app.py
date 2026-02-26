@@ -3239,13 +3239,15 @@ def api_all_course_formulas_list():
 @app.route('/api/courses/<int:course_id>/questions', methods=['GET'])
 def api_course_questions(course_id):
     """Get all quiz questions for formulas linked to this course for the current user. Auth required; user must be enrolled.
-    Query param: segment (optional filter by segment name)."""
+    Query params: segment (optional filter by segment name); topics (optional comma-separated topic_handles to filter by)."""
     try:
         claims = _get_current_user()
         if not claims:
             return jsonify({"error": "Not authenticated"}), 401
         user_id = claims["user_id"]
         segment = request.args.get("segment", "").strip() or None
+        topics_param = request.args.get("topics", "").strip()
+        topic_handles = [h.strip() for h in topics_param.split(",") if h.strip()] if topics_param else None
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute("""
@@ -3259,11 +3261,20 @@ def api_course_questions(course_id):
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
         course_name, course_code = row
-        cur.execute("""
-            SELECT ucf.formula_id FROM tbl_user_course_formula ucf
-            WHERE ucf.user_id = %s AND ucf.course_id = %s
-            AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s));
-        """, (user_id, course_id, segment, segment))
+        if topic_handles:
+            cur.execute("""
+                SELECT ucf.formula_id FROM tbl_user_course_formula ucf
+                JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+                WHERE ucf.user_id = %s AND ucf.course_id = %s
+                  AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s))
+                  AND COALESCE(NULLIF(TRIM(f.topic_handle), ''), 'uncategorized') = ANY(%s);
+            """, (user_id, course_id, segment, segment, topic_handles))
+        else:
+            cur.execute("""
+                SELECT ucf.formula_id FROM tbl_user_course_formula ucf
+                WHERE ucf.user_id = %s AND ucf.course_id = %s
+                AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s));
+            """, (user_id, course_id, segment, segment))
         formula_ids = [r[0] for r in cur.fetchall()]
         cur.close()
         conn.close()
@@ -3523,6 +3534,53 @@ def api_course_terms_list(course_id):
                 }
                 for r in rows
             ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/topics', methods=['GET'])
+def api_course_topics(course_id):
+    """List distinct topics from terms and formulas linked to this course for the current user.
+    Auth required; user must be enrolled. Query param: segment (optional filter by segment name)."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        segment = request.args.get("segment", "").strip() or None
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("""
+            SELECT DISTINCT COALESCE(NULLIF(TRIM(f.topic_handle), ''), 'uncategorized') AS topic_handle,
+                   COALESCE(tp.topic_name, 'Uncategorized') AS topic_name
+            FROM tbl_user_course_formula ucf
+            JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+            LEFT JOIN tbl_topic tp ON tp.topic_handle = f.topic_handle
+            WHERE ucf.user_id = %s AND ucf.course_id = %s
+              AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s))
+            UNION
+            SELECT DISTINCT COALESCE(NULLIF(TRIM(t.topic_handle), ''), 'uncategorized') AS topic_handle,
+                   COALESCE(tp2.topic_name, 'Uncategorized') AS topic_name
+            FROM tbl_user_course_term uct
+            JOIN tbl_term t ON t.term_id = uct.term_id
+            LEFT JOIN tbl_topic tp2 ON tp2.topic_handle = t.topic_handle
+            WHERE uct.user_id = %s AND uct.course_id = %s
+              AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s))
+            ORDER BY topic_name;
+        """, (user_id, course_id, segment, segment, user_id, course_id, segment, segment))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "topics": [{"topic_handle": r[0], "topic_name": r[1]} for r in rows]
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4207,13 +4265,15 @@ def api_exam_sheet_compile():
 @app.route('/api/courses/<int:course_id>/term-questions', methods=['GET'])
 def api_course_term_questions(course_id):
     """Get all quiz questions for terms linked to this course for the current user. Auth required; user must be enrolled.
-    Query param: segment (optional filter by segment name)."""
+    Query params: segment (optional filter by segment name); topics (optional comma-separated topic_handles to filter by)."""
     try:
         claims = _get_current_user()
         if not claims:
             return jsonify({"error": "Not authenticated"}), 401
         user_id = claims["user_id"]
         segment = request.args.get("segment", "").strip() or None
+        topics_param = request.args.get("topics", "").strip()
+        topic_handles = [h.strip() for h in topics_param.split(",") if h.strip()] if topics_param else None
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute("""
@@ -4227,11 +4287,20 @@ def api_course_term_questions(course_id):
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
         course_name, course_code = row
-        cur.execute("""
-            SELECT uct.term_id FROM tbl_user_course_term uct
-            WHERE uct.user_id = %s AND uct.course_id = %s
-            AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s));
-        """, (user_id, course_id, segment, segment))
+        if topic_handles:
+            cur.execute("""
+                SELECT uct.term_id FROM tbl_user_course_term uct
+                JOIN tbl_term t ON t.term_id = uct.term_id
+                WHERE uct.user_id = %s AND uct.course_id = %s
+                  AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s))
+                  AND COALESCE(NULLIF(TRIM(t.topic_handle), ''), 'uncategorized') = ANY(%s);
+            """, (user_id, course_id, segment, segment, topic_handles))
+        else:
+            cur.execute("""
+                SELECT uct.term_id FROM tbl_user_course_term uct
+                WHERE uct.user_id = %s AND uct.course_id = %s
+                AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s));
+            """, (user_id, course_id, segment, segment))
         term_ids = [r[0] for r in cur.fetchall()]
         cur.close()
         conn.close()
