@@ -3635,6 +3635,389 @@ def api_course_term_remove(course_id, term_id):
         return jsonify({"error": str(e)}), 500
 
 
+def _load_exam_sheet_template_for_user(user_id, course_id, segment, template_id):
+    """Return exam-sheet template topics/items (including include/order flags) for builder UI."""
+    conn = _auth_db()
+    cur = conn.cursor()
+    try:
+        # Verify enrollment and get course metadata
+        cur.execute("""
+            SELECT c.course_name, c.course_code
+            FROM tbl_user_course uc
+            JOIN tbl_course c ON c.course_id = uc.course_id
+            WHERE uc.user_id = %s AND uc.course_id = %s;
+        """, (user_id, course_id))
+        course_row = cur.fetchone()
+        if course_row is None:
+            return None, None
+
+        # Template-level topic and item flags
+        topic_order_map = {}
+        topic_include_map = {}
+        item_order_map = {}
+        item_include_map = {}
+        worked_example_map = {}
+
+        cur.execute("""
+            SELECT topic_handle, topic_order, include_flag
+            FROM tbl_exam_sheet_template_topic
+            WHERE template_id = %s;
+        """, (template_id,))
+        for h, order_val, include_flag in cur.fetchall():
+            topic_order_map[h] = order_val if order_val is not None else 0
+            topic_include_map[h] = bool(include_flag)
+
+        cur.execute("""
+            SELECT item_type, item_handle, item_order, include_flag, worked_example_mode, topic_handle
+            FROM tbl_exam_sheet_template_item
+            WHERE template_id = %s;
+        """, (template_id,))
+        for item_type, item_handle, order_val, include_flag, wem, topic_handle in cur.fetchall():
+            key = (item_type, item_handle)
+            item_order_map[key] = order_val if order_val is not None else 0
+            item_include_map[key] = bool(include_flag)
+            worked_example_map[key] = wem
+            # topic_handle on the item is advisory; builder primarily uses topic from source rows
+
+        # Source items for this user's course+segment
+        cur.execute("""
+            SELECT t.term_id, t.term_name, t.definition, uct.display_order,
+                   COALESCE(NULLIF(TRIM(t.topic_handle), ''), 'uncategorized') AS topic_handle,
+                   COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
+                   t.term_handle
+            FROM tbl_user_course_term uct
+            JOIN tbl_term t ON t.term_id = uct.term_id
+            LEFT JOIN tbl_topic tp ON tp.topic_handle = t.topic_handle
+            WHERE uct.user_id = %s
+              AND uct.course_id = %s
+              AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s))
+            ORDER BY uct.display_order NULLS LAST, t.term_name;
+        """, (user_id, course_id, segment, segment))
+        term_rows = cur.fetchall()
+
+        cur.execute("""
+            SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order,
+                   COALESCE(NULLIF(TRIM(f.topic_handle), ''), 'uncategorized') AS topic_handle,
+                   COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
+                   f.formula_handle, f.example
+            FROM tbl_user_course_formula ucf
+            JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+            LEFT JOIN tbl_topic tp ON tp.topic_handle = f.topic_handle
+            WHERE ucf.user_id = %s
+              AND ucf.course_id = %s
+              AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s))
+            ORDER BY ucf.display_order NULLS LAST, f.formula_name;
+        """, (user_id, course_id, segment, segment))
+        formula_rows = cur.fetchall()
+
+        topics = {}
+
+        for row in term_rows:
+            term_id, term_name, definition, display_order, topic_handle, topic_name, term_handle = row
+            item_handle = term_handle or f"term_id_{term_id}"
+            key = ("term", item_handle)
+            bucket = topics.setdefault(topic_handle, {
+                "topic_handle": topic_handle,
+                "topic_name": topic_name,
+                "include": topic_include_map.get(topic_handle, True),
+                "order": topic_order_map.get(topic_handle),
+                "terms": [],
+                "formulas": [],
+            })
+            bucket["terms"].append({
+                "item_type": "term",
+                "item_handle": item_handle,
+                "term_id": term_id,
+                "term_name": term_name,
+                "definition": definition,
+                "include": item_include_map.get(key, True),
+                "order": item_order_map.get(key),
+            })
+
+        for row in formula_rows:
+            formula_id, formula_name, latex, display_order, topic_handle, topic_name, formula_handle, example = row
+            item_handle = formula_handle or f"formula_id_{formula_id}"
+            key = ("formula", item_handle)
+            bucket = topics.setdefault(topic_handle, {
+                "topic_handle": topic_handle,
+                "topic_name": topic_name,
+                "include": topic_include_map.get(topic_handle, True),
+                "order": topic_order_map.get(topic_handle),
+                "terms": [],
+                "formulas": [],
+            })
+            mode = worked_example_map.get(key, "auto")
+            bucket["formulas"].append({
+                "item_type": "formula",
+                "item_handle": item_handle,
+                "id": formula_id,
+                "formula_name": formula_name,
+                "latex": latex,
+                "example": example,
+                "worked_example_mode": mode,
+                "include": item_include_map.get(key, True),
+                "order": item_order_map.get(key),
+            })
+
+        topic_list = list(topics.values())
+        topic_list.sort(key=lambda t: (
+            t["order"] if t["order"] is not None else 10**9,
+            t["topic_name"].lower(),
+        ))
+
+        for topic in topic_list:
+            topic["terms"].sort(key=lambda item: (
+                item["order"] if item["order"] is not None else 10**9,
+                item["term_name"].lower(),
+            ))
+            topic["formulas"].sort(key=lambda item: (
+                item["order"] if item["order"] is not None else 10**9,
+                item["formula_name"].lower(),
+            ))
+
+        payload = {
+            "course_id": course_id,
+            "course_name": course_row[0],
+            "course_code": course_row[1],
+            "segment": segment,
+            "template_id": template_id,
+            "topics": topic_list,
+        }
+        return payload, None
+    finally:
+        cur.close()
+        conn.close()
+
+
+@app.route('/api/exam_sheet/template/initialize', methods=['POST'])
+def api_exam_sheet_template_initialize():
+    """Ensure an exam-sheet template exists for course+segment and return its editable structure."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        data = request.get_json() or {}
+        course_id = data.get("course_id")
+        if course_id is None:
+            return jsonify({"error": "course_id is required"}), 400
+        try:
+            course_id = int(course_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "course_id must be an integer"}), 400
+        segment = (str(data.get("segment") or "")).strip() or None
+
+        conn = _auth_db()
+        cur = conn.cursor()
+
+        # Verify enrollment
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course
+            WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+
+        # Find or create template for this course+segment scope
+        cur.execute("""
+            SELECT template_id
+            FROM tbl_exam_sheet_template
+            WHERE course_id = %s
+              AND COALESCE(TRIM(segment_label), '') = COALESCE(TRIM(%s), '');
+        """, (course_id, segment))
+        row = cur.fetchone()
+        if row:
+            template_id = row[0]
+        else:
+            cur.execute("""
+                INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name)
+                VALUES (%s, %s, %s, %s)
+                RETURNING template_id;
+            """, (course_id, segment, user_id, None))
+            template_id = cur.fetchone()[0]
+
+        # Seed topics/items if template is empty
+        cur.execute("""
+            SELECT COUNT(*) FROM tbl_exam_sheet_template_item
+            WHERE template_id = %s;
+        """, (template_id,))
+        has_items = cur.fetchone()[0] > 0
+
+        if not has_items:
+            # Gather source items in default order
+            cur.execute("""
+                SELECT t.term_id, t.term_name, t.definition, uct.display_order,
+                       COALESCE(NULLIF(TRIM(t.topic_handle), ''), 'uncategorized') AS topic_handle,
+                       COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
+                       t.term_handle
+                FROM tbl_user_course_term uct
+                JOIN tbl_term t ON t.term_id = uct.term_id
+                LEFT JOIN tbl_topic tp ON tp.topic_handle = t.topic_handle
+                WHERE uct.user_id = %s
+                  AND uct.course_id = %s
+                  AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s))
+                ORDER BY uct.display_order NULLS LAST, t.term_name;
+            """, (user_id, course_id, segment, segment))
+            term_rows = cur.fetchall()
+
+            cur.execute("""
+                SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order,
+                       COALESCE(NULLIF(TRIM(f.topic_handle), ''), 'uncategorized') AS topic_handle,
+                       COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
+                       f.formula_handle, f.example
+                FROM tbl_user_course_formula ucf
+                JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+                LEFT JOIN tbl_topic tp ON tp.topic_handle = f.topic_handle
+                WHERE ucf.user_id = %s
+                  AND ucf.course_id = %s
+                  AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s))
+                ORDER BY ucf.display_order NULLS LAST, f.formula_name;
+            """, (user_id, course_id, segment, segment))
+            formula_rows = cur.fetchall()
+
+            # Seed topics
+            seen_topics = {}
+            topic_order_counter = 0
+            for row in term_rows + formula_rows:
+                topic_handle = row[4]
+                topic_name = row[5]
+                if topic_handle not in seen_topics:
+                    cur.execute("""
+                        INSERT INTO tbl_exam_sheet_template_topic (template_id, topic_handle, topic_order, include_flag)
+                        VALUES (%s, %s, %s, %s)
+                        ON CONFLICT (template_id, topic_handle) DO NOTHING;
+                    """, (template_id, topic_handle, topic_order_counter, True))
+                    seen_topics[topic_handle] = topic_order_counter
+                    topic_order_counter += 1
+
+            # Seed items with stable per-type ordering
+            term_idx = 0
+            for row in term_rows:
+                term_id, term_name, definition, display_order, topic_handle, topic_name, term_handle = row
+                item_handle = term_handle or f"term_id_{term_id}"
+                cur.execute("""
+                    INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (template_id, item_type, item_handle) DO NOTHING;
+                """, (template_id, "term", item_handle, topic_handle, term_idx, True, "auto"))
+                term_idx += 1
+
+            formula_idx = 0
+            for row in formula_rows:
+                formula_id, formula_name, latex, display_order, topic_handle, topic_name, formula_handle, example = row
+                item_handle = formula_handle or f"formula_id_{formula_id}"
+                cur.execute("""
+                    INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (template_id, item_type, item_handle) DO NOTHING;
+                """, (template_id, "formula", item_handle, topic_handle, formula_idx, True, "auto"))
+                formula_idx += 1
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        payload, err = _load_exam_sheet_template_for_user(user_id, course_id, segment, template_id)
+        if payload is None:
+            # Enrollment changed between calls
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/exam_sheet/template', methods=['PATCH'])
+def api_exam_sheet_template_update():
+    """Update include/order settings for exam-sheet template topics and items."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        data = request.get_json() or {}
+        template_id = data.get("template_id")
+        if template_id is None:
+            return jsonify({"error": "template_id is required"}), 400
+        try:
+            template_id = int(template_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "template_id must be an integer"}), 400
+
+        conn = _auth_db()
+        cur = conn.cursor()
+
+        # Verify template belongs to a course the user is enrolled in
+        cur.execute("""
+            SELECT course_id FROM tbl_exam_sheet_template
+            WHERE template_id = %s;
+        """, (template_id,))
+        row = cur.fetchone()
+        if row is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Template not found"}), 404
+        course_id = row[0]
+
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course
+            WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+
+        topic_updates = data.get("topic_updates") or []
+        item_updates = data.get("item_updates") or []
+
+        for tu in topic_updates:
+            topic_handle = (tu.get("topic_handle") or "").strip()
+            if not topic_handle:
+                continue
+            include = tu.get("include")
+            order = tu.get("order")
+            cur.execute("""
+                INSERT INTO tbl_exam_sheet_template_topic (template_id, topic_handle, topic_order, include_flag)
+                VALUES (%s, %s, COALESCE(%s, 0), COALESCE(%s, true))
+                ON CONFLICT (template_id, topic_handle) DO UPDATE
+                SET topic_order = COALESCE(EXCLUDED.topic_order, tbl_exam_sheet_template_topic.topic_order),
+                    include_flag = COALESCE(EXCLUDED.include_flag, tbl_exam_sheet_template_topic.include_flag),
+                    updated_at = CURRENT_TIMESTAMP;
+            """, (template_id, topic_handle, order, include))
+
+        for iu in item_updates:
+            item_type = (iu.get("item_type") or "").strip()
+            if item_type not in ("term", "formula"):
+                continue
+            item_handle = (iu.get("item_handle") or "").strip()
+            if not item_handle:
+                continue
+            topic_handle = (iu.get("topic_handle") or "").strip() or None
+            include = iu.get("include")
+            order = iu.get("order")
+            worked_example_mode = (iu.get("worked_example_mode") or None)
+            cur.execute("""
+                INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode)
+                VALUES (%s, %s, %s, %s, COALESCE(%s, 0), COALESCE(%s, true), COALESCE(%s, 'auto'))
+                ON CONFLICT (template_id, item_type, item_handle) DO UPDATE
+                SET topic_handle = COALESCE(EXCLUDED.topic_handle, tbl_exam_sheet_template_item.topic_handle),
+                    item_order = COALESCE(EXCLUDED.item_order, tbl_exam_sheet_template_item.item_order),
+                    include_flag = COALESCE(EXCLUDED.include_flag, tbl_exam_sheet_template_item.include_flag),
+                    worked_example_mode = COALESCE(EXCLUDED.worked_example_mode, tbl_exam_sheet_template_item.worked_example_mode),
+                    updated_at = CURRENT_TIMESTAMP;
+            """, (template_id, item_type, item_handle, topic_handle, order, include, worked_example_mode))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({"template_id": template_id, "message": "Template updated"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/exam_sheet/compile', methods=['POST'])
 def api_exam_sheet_compile():
     """Compile exam-sheet payload grouped by topic handle and item order."""
