@@ -700,6 +700,109 @@ def api_topics_list():
     ])
 
 
+@app.route('/api/topics/export', methods=['GET'])
+def api_topics_export():
+    """Export all topics as JSON (admin only). Match/import by topic_handle."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT topic_id, topic_name, topic_handle
+        FROM tbl_topic
+        ORDER BY topic_name;
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    topics = []
+    for row in rows:
+        tid, name, handle = row
+        topics.append({
+            "topic_id": tid,
+            "topic_handle": (handle or "").strip().lower(),
+            "topic_name": name,
+        })
+    return jsonify({
+        "exported_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+        "topics": topics,
+    })
+
+
+@app.route('/api/topics/import', methods=['POST'])
+def api_topics_import():
+    """Bulk import topics from JSON (admin only). Match by topic_handle only (cross-env safe); insert when handle is new."""
+    claims, err = _require_admin()
+    if err:
+        return err
+    data = request.get_json()
+    if not data or not isinstance(data, dict):
+        return jsonify({"error": "JSON body required"}), 400
+    items = data.get("topics")
+    if not isinstance(items, list):
+        return jsonify({"error": "topics array required"}), 400
+
+    seen_handles = set()
+    for i, row in enumerate(items):
+        if not isinstance(row, dict):
+            return jsonify({
+                "error": "Invalid file format.",
+                "details": [f"Record {i + 1} is not a valid object. Each topic must be a JSON object with topic_name and topic_handle."]
+            }), 400
+        th = (str(row.get("topic_handle") or row.get("handle") or "")).strip().lower()
+        if not th:
+            return jsonify({
+                "error": "Missing topic_handle.",
+                "details": [f"Record {i + 1} is missing topic_handle. Imports key on handles only; each topic must include a unique topic_handle."]
+            }), 400
+        if th in seen_handles:
+            return jsonify({
+                "error": "Duplicate topic_handle.",
+                "details": [f"Record {i + 1} has topic_handle '{th}' which appears more than once in the file. Handles must be unique within the import."]
+            }), 400
+        seen_handles.add(th)
+        name = (str(row.get("topic_name") or row.get("name") or "")).strip()
+        if not name:
+            return jsonify({
+                "error": "Missing topic_name.",
+                "details": [f"Record {i + 1} is missing topic_name. Each topic must include a human-readable name."]
+            }), 400
+
+    conn = _auth_db()
+    cur = conn.cursor()
+    inserted = 0
+    updated = 0
+    try:
+        for row in items:
+            th = (str(row.get("topic_handle") or row.get("handle") or "")).strip().lower()
+            name = (str(row.get("topic_name") or row.get("name") or "")).strip()
+            cur.execute("SELECT topic_id FROM tbl_topic WHERE topic_handle = %s;", (th,))
+            existing = cur.fetchone()
+            if existing:
+                cur.execute("""
+                    UPDATE tbl_topic
+                    SET topic_name = %s, updated_at = CURRENT_TIMESTAMP
+                    WHERE topic_handle = %s;
+                """, (name, th))
+                updated += 1
+            else:
+                cur.execute("""
+                    INSERT INTO tbl_topic (topic_name, topic_handle)
+                    VALUES (%s, %s);
+                """, (name, th))
+                inserted += 1
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        cur.close()
+        conn.close()
+        return jsonify({"error": str(e)}), 500
+    cur.close()
+    conn.close()
+    return jsonify({"inserted": inserted, "updated": updated}), 200
+
+
 @app.route('/api/topics', methods=['POST'])
 def api_topic_create():
     """Create a topic (admin only)."""
