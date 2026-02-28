@@ -975,7 +975,7 @@ def get_term_by_id(term_id):
     conn = psycopg2.connect(DATABASE_URL, sslmode=sslmode)
     cursor = conn.cursor()
     cursor.execute("""
-        SELECT term_id, term_name, definition, formulaic_expression
+        SELECT term_id, term_name, definition, formulaic_expression, topic_handle
         FROM tbl_term
         WHERE term_id = %s;
     """, (term_id,))
@@ -984,7 +984,13 @@ def get_term_by_id(term_id):
     conn.close()
     if not row:
         return None
-    return {"id": row[0], "term_name": row[1], "definition": row[2], "formulaic_expression": row[3]}
+    return {
+        "id": row[0],
+        "term_name": row[1],
+        "definition": row[2],
+        "formulaic_expression": row[3],
+        "topic_handle": row[4] if row[4] else None,
+    }
 
 
 def get_questions_by_term_id(term_id):
@@ -1359,7 +1365,7 @@ def api_term_update(term_id):
     data = request.get_json()
     if not data or not isinstance(data, dict):
         return jsonify({"error": "JSON body required"}), 400
-    allowed = {"term_name", "definition", "formulaic_expression"}
+    allowed = {"term_name", "definition", "formulaic_expression", "topic_handle"}
     updates = {}
     for k in allowed:
         if k not in data:
@@ -1375,6 +1381,8 @@ def api_term_update(term_id):
             if not s:
                 return jsonify({"error": "definition cannot be empty"}), 400
             updates[k] = s
+        elif k == "topic_handle":
+            updates[k] = None if v is None or (isinstance(v, str) and not v.strip()) else (str(v).strip().lower() if isinstance(v, str) else str(v))
         else:
             updates[k] = None if v is None or (isinstance(v, str) and not v.strip()) else (v.strip() if isinstance(v, str) else v)
     if not updates:
@@ -3828,16 +3836,19 @@ def _load_exam_sheet_template_for_user(user_id, course_id, segment, template_id)
             topic_order_map[h] = order_val if order_val is not None else 0
             topic_include_map[h] = bool(include_flag)
 
+        item_hide_name_map = {}
         cur.execute("""
-            SELECT item_type, item_handle, item_order, include_flag, worked_example_mode, topic_handle
+            SELECT item_type, item_handle, item_order, include_flag, worked_example_mode, topic_handle,
+                   COALESCE(hide_name, false)
             FROM tbl_exam_sheet_template_item
             WHERE template_id = %s;
         """, (template_id,))
-        for item_type, item_handle, order_val, include_flag, wem, topic_handle in cur.fetchall():
+        for item_type, item_handle, order_val, include_flag, wem, topic_handle, hide_name in cur.fetchall():
             key = (item_type, item_handle)
             item_order_map[key] = order_val if order_val is not None else 0
             item_include_map[key] = bool(include_flag)
             worked_example_map[key] = wem
+            item_hide_name_map[key] = bool(hide_name)
             # topic_handle on the item is advisory; builder primarily uses topic from source rows
 
         # Source items for this user's course+segment
@@ -3893,6 +3904,7 @@ def _load_exam_sheet_template_for_user(user_id, course_id, segment, template_id)
                 "definition": definition,
                 "include": item_include_map.get(key, True),
                 "order": item_order_map.get(key),
+                "hide_name": item_hide_name_map.get(key, False),
             })
 
         for row in formula_rows:
@@ -3918,6 +3930,7 @@ def _load_exam_sheet_template_for_user(user_id, course_id, segment, template_id)
                 "worked_example_mode": mode,
                 "include": item_include_map.get(key, True),
                 "order": item_order_map.get(key),
+                "hide_name": item_hide_name_map.get(key, False),
             })
 
         topic_list = list(topics.values())
@@ -4059,8 +4072,8 @@ def api_exam_sheet_template_initialize():
                 term_id, term_name, definition, display_order, topic_handle, topic_name, term_handle = row
                 item_handle = term_handle or f"term_id_{term_id}"
                 cur.execute("""
-                    INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode, hide_name)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, false)
                     ON CONFLICT (template_id, item_type, item_handle) DO NOTHING;
                 """, (template_id, "term", item_handle, topic_handle, term_idx, True, "auto"))
                 term_idx += 1
@@ -4070,8 +4083,8 @@ def api_exam_sheet_template_initialize():
                 formula_id, formula_name, latex, display_order, topic_handle, topic_name, formula_handle, example = row
                 item_handle = formula_handle or f"formula_id_{formula_id}"
                 cur.execute("""
-                    INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode, hide_name)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, false)
                     ON CONFLICT (template_id, item_type, item_handle) DO NOTHING;
                 """, (template_id, "formula", item_handle, topic_handle, formula_idx, True, "auto"))
                 formula_idx += 1
@@ -4159,16 +4172,18 @@ def api_exam_sheet_template_update():
             include = iu.get("include")
             order = iu.get("order")
             worked_example_mode = (iu.get("worked_example_mode") or None)
+            hide_name = iu.get("hide_name")
             cur.execute("""
-                INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode)
-                VALUES (%s, %s, %s, %s, COALESCE(%s, 0), COALESCE(%s, true), COALESCE(%s, 'auto'))
+                INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode, hide_name)
+                VALUES (%s, %s, %s, %s, COALESCE(%s, 0), COALESCE(%s, true), COALESCE(%s, 'auto'), COALESCE(%s, false))
                 ON CONFLICT (template_id, item_type, item_handle) DO UPDATE
                 SET topic_handle = COALESCE(EXCLUDED.topic_handle, tbl_exam_sheet_template_item.topic_handle),
                     item_order = COALESCE(EXCLUDED.item_order, tbl_exam_sheet_template_item.item_order),
                     include_flag = COALESCE(EXCLUDED.include_flag, tbl_exam_sheet_template_item.include_flag),
                     worked_example_mode = COALESCE(EXCLUDED.worked_example_mode, tbl_exam_sheet_template_item.worked_example_mode),
+                    hide_name = COALESCE(EXCLUDED.hide_name, tbl_exam_sheet_template_item.hide_name),
                     updated_at = CURRENT_TIMESTAMP;
-            """, (template_id, item_type, item_handle, topic_handle, order, include, worked_example_mode))
+            """, (template_id, item_type, item_handle, topic_handle, order, include, worked_example_mode, hide_name))
 
         conn.commit()
         cur.close()
@@ -4254,6 +4269,7 @@ def api_exam_sheet_compile():
         item_order_map = {}
         item_include_map = {}
         worked_example_map = {}
+        item_hide_name_map = {}
         if template_id is not None:
             cur.execute("""
                 SELECT topic_handle, topic_order, include_flag
@@ -4265,15 +4281,17 @@ def api_exam_sheet_compile():
                 topic_include_map[h] = bool(include_flag)
 
             cur.execute("""
-                SELECT item_type, item_handle, item_order, include_flag, worked_example_mode
+                SELECT item_type, item_handle, item_order, include_flag, worked_example_mode,
+                       COALESCE(hide_name, false)
                 FROM tbl_exam_sheet_template_item
                 WHERE template_id = %s;
             """, (template_id,))
-            for item_type, item_handle, order_val, include_flag, wem in cur.fetchall():
+            for item_type, item_handle, order_val, include_flag, wem, hide_name in cur.fetchall():
                 key = (item_type, item_handle)
                 item_order_map[key] = order_val if order_val is not None else 0
                 item_include_map[key] = bool(include_flag)
                 worked_example_map[key] = wem
+                item_hide_name_map[key] = bool(hide_name)
 
         cur.close()
         conn.close()
@@ -4299,6 +4317,7 @@ def api_exam_sheet_compile():
                 "term_handle": term_handle,
                 "term_name": term_name,
                 "definition": definition,
+                "hide_name": item_hide_name_map.get(key, False),
                 "_sort_display_order": display_order if display_order is not None else 10**9,
                 "_sort_item_order": item_order_map.get(key),
             })
@@ -4326,6 +4345,7 @@ def api_exam_sheet_compile():
                 "latex": latex,
                 "example": example if include_example else None,
                 "worked_example_mode": mode,
+                "hide_name": item_hide_name_map.get(key, False),
                 "_sort_display_order": display_order if display_order is not None else 10**9,
                 "_sort_item_order": item_order_map.get(key),
             })
