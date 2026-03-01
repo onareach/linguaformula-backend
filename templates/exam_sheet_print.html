@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Exam Reference Sheet</title>
+  <script>
+    window.__MATHJAX_DONE__ = false;
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; overflow: visible; font-family: Georgia, 'Times New Roman', serif; font-size: 8px; line-height: 1.2; color: #1a1a1a; }
+    @page { size: letter landscape; margin: 10mm; }
+    .page { width: 11in; min-height: 0; padding: 0.3in; page-break-after: auto; overflow: visible; box-sizing: border-box; }
+    .page-header { margin-bottom: 0.12in; }
+    .page-header .label { font-size: 7px; text-transform: uppercase; letter-spacing: 0.05em; color: #555; }
+    .page-header h2 { font-size: 11px; font-weight: 600; margin: 0.04in 0 0 0; }
+    .columns { display: flex; flex-direction: row; gap: 0.25in; }
+    .column { flex: 1; min-width: 0; width: 50%; }
+    .topic { margin-bottom: 0.1in; break-inside: auto; }
+    .topic-title { font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; margin-bottom: 0.05in; }
+    .terms-section, .formulas-section { margin-bottom: 0.06in; }
+    .section-heading { font-size: 7px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.02em; margin-bottom: 0.03in; }
+    .term-item, .formula-item { margin-bottom: 0.04in; break-inside: avoid; }
+    .term-name, .formula-name { font-weight: 600; margin-bottom: 0.02in; font-size: 8px; }
+    .term-definition { font-size: 8px; color: #333; display: block; line-height: 1.2; }
+    .term-definition p { margin: 0 0 0.1em 0; }
+    .term-definition:empty::after { content: '\00a0'; }
+    .formula-latex { margin: 0.03in 0; overflow-x: auto; font-size: 8px; }
+    .formula-example { font-size: 8px; color: #333; margin-top: 0.02in; }
+    .formula-no-text { font-style: italic; color: #666; font-size: 8px; }
+    .no-content-hint { font-size: 8px; color: #666; margin: 0.1in 0; font-style: italic; }
+  </style>
+</head>
+<body>
+  {% if no_content %}
+  <div class="page">
+    <div class="page-header">
+      <p class="label">Exam reference sheet</p>
+      <h2>{% if course_code %}{{ course_code }}: {% endif %}{{ course_name }}{% if segment %} — {{ segment }}{% endif %}</h2>
+    </div>
+    <p style="margin: 0.5in 0; padding: 0.3in; background: #f5f5f5; border: 1px solid #ccc;">No content included. In the exam sheet builder, check the terms and formulas you want, click <strong>Apply changes</strong>, then try <strong>Preview &amp; Print (PDF)</strong> again.</p>
+  </div>
+  {% else %}
+  {% for side in sides %}
+  <div class="page">
+    <div class="page-header">
+      <p class="label">{{ side.label }}</p>
+      <h2>{% if course_code %}{{ course_code }}: {% endif %}{{ course_name }}{% if segment %} — {{ segment }}{% endif %}</h2>
+    </div>
+    {% set left_has_any = side.left_topics and ((side.left_topics | selectattr('terms') | list | length > 0) or (side.left_topics | selectattr('formulas') | list | length > 0)) %}
+    {% set right_has_any = side.right_topics and ((side.right_topics | selectattr('terms') | list | length > 0) or (side.right_topics | selectattr('formulas') | list | length > 0)) %}
+    {% set page_has_content = left_has_any or right_has_any %}
+    <div class="columns">
+      <div class="column">
+        {% if not page_has_content %}
+        <p class="no-content-hint">Content on other side.</p>
+        {% endif %}
+        {% for topic in side.left_topics %}
+        {% if topic.terms or topic.formulas %}
+        <div class="topic">
+          <h3 class="topic-title">{{ topic.topic_name }}</h3>
+          {% if topic.terms %}
+          <div class="terms-section">
+            <h4 class="section-heading">Terms</h4>
+            {% for t in topic.terms %}
+            <div class="term-item">
+              {% if not t.hide_name %}<p class="term-name">{{ t.term_name }}</p>{% endif %}
+              <div class="term-definition">{{ (t.definition or '') | markdown | safe }}</div>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if topic.formulas %}
+          <div class="formulas-section">
+            <h4 class="section-heading">Formulas</h4>
+            {% for f in topic.formulas %}
+            <div class="formula-item">
+              {% if not f.hide_name %}<p class="formula-name">{{ f.formula_name }}</p>{% endif %}
+              {% if f.latex %}
+              <div class="formula-latex">\\( {{ f.latex | e }} \\)</div>
+              {% else %}
+              <p class="formula-no-text">No formula text</p>
+              {% endif %}
+              {% if f.example %}<p class="formula-example">{{ f.example }}</p>{% endif %}
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
+      <div class="column">
+        {% for topic in side.right_topics %}
+        {% if topic.terms or topic.formulas %}
+        <div class="topic">
+          <h3 class="topic-title">{{ topic.topic_name }}</h3>
+          {% if topic.terms %}
+          <div class="terms-section">
+            <h4 class="section-heading">Terms</h4>
+            {% for t in topic.terms %}
+            <div class="term-item">
+              {% if not t.hide_name %}<p class="term-name">{{ t.term_name }}</p>{% endif %}
+              <div class="term-definition">{{ (t.definition or '') | markdown | safe }}</div>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if topic.formulas %}
+          <div class="formulas-section">
+            <h4 class="section-heading">Formulas</h4>
+            {% for f in topic.formulas %}
+            <div class="formula-item">
+              {% if not f.hide_name %}<p class="formula-name">{{ f.formula_name }}</p>{% endif %}
+              {% if f.latex %}
+              <div class="formula-latex">\\( {{ f.latex | e }} \\)</div>
+              {% else %}
+              <p class="formula-no-text">No formula text</p>
+              {% endif %}
+              {% if f.example %}<p class="formula-example">{{ f.example }}</p>{% endif %}
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </div>
+        {% endif %}
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+  {% endfor %}
+  {% endif %}
+  <script>
+    (function() {
+      if (window.MathJax && window.MathJax.typesetPromise) {
+        MathJax.typesetPromise().then(function() { window.__MATHJAX_DONE__ = true; }).catch(function() { window.__MATHJAX_DONE__ = true; });
+      } else {
+        var check = setInterval(function() {
+          if (window.MathJax && window.MathJax.typesetPromise) {
+            clearInterval(check);
+            MathJax.typesetPromise().then(function() { window.__MATHJAX_DONE__ = true; }).catch(function() { window.__MATHJAX_DONE__ = true; });
+          }
+        }, 50);
+        setTimeout(function() { clearInterval(check); window.__MATHJAX_DONE__ = true; }, 15000);
+      }
+    })();
+  </script>
+</body>
+</html>

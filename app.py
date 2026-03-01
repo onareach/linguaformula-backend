@@ -4194,6 +4194,173 @@ def api_exam_sheet_template_update():
         return jsonify({"error": str(e)}), 500
 
 
+def _get_exam_sheet_compile_payload(user_id, course_id, segment, template_id):
+    """
+    Build exam-sheet compile payload (course_name, course_code, segment, topics).
+    Returns (payload_dict, None) on success, (None, (response, status_code)) on error.
+    """
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("""
+            SELECT c.course_name, c.course_code
+            FROM tbl_user_course uc
+            JOIN tbl_course c ON c.course_id = uc.course_id
+            WHERE uc.user_id = %s AND uc.course_id = %s;
+        """, (user_id, course_id))
+    course_row = cur.fetchone()
+    if course_row is None:
+        cur.close()
+        conn.close()
+        return None, (jsonify({"error": "Course not found or you are not enrolled"}), 404)
+
+    cur.execute("""
+            SELECT t.term_id, t.term_name, t.definition, uct.display_order,
+                   COALESCE(NULLIF(TRIM(t.topic_handle), ''), 'uncategorized') AS topic_handle,
+                   COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
+                   t.term_handle
+            FROM tbl_user_course_term uct
+            JOIN tbl_term t ON t.term_id = uct.term_id
+            LEFT JOIN tbl_topic tp ON tp.topic_handle = t.topic_handle
+            WHERE uct.user_id = %s
+              AND uct.course_id = %s
+              AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s))
+            ORDER BY uct.display_order NULLS LAST, t.term_name;
+        """, (user_id, course_id, segment, segment))
+    term_rows = cur.fetchall()
+
+    cur.execute("""
+            SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order,
+                   COALESCE(NULLIF(TRIM(f.topic_handle), ''), 'uncategorized') AS topic_handle,
+                   COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
+                   f.formula_handle, f.example
+            FROM tbl_user_course_formula ucf
+            JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+            LEFT JOIN tbl_topic tp ON tp.topic_handle = f.topic_handle
+            WHERE ucf.user_id = %s
+              AND ucf.course_id = %s
+              AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s))
+            ORDER BY ucf.display_order NULLS LAST, f.formula_name;
+        """, (user_id, course_id, segment, segment))
+    formula_rows = cur.fetchall()
+
+    topic_order_map = {}
+    topic_include_map = {}
+    item_order_map = {}
+    item_include_map = {}
+    worked_example_map = {}
+    item_hide_name_map = {}
+    if template_id is not None:
+        cur.execute("""
+                SELECT topic_handle, topic_order, include_flag
+                FROM tbl_exam_sheet_template_topic
+                WHERE template_id = %s;
+            """, (template_id,))
+        for h, order_val, include_flag in cur.fetchall():
+            topic_order_map[h] = order_val if order_val is not None else 0
+            topic_include_map[h] = bool(include_flag)
+
+        cur.execute("""
+                SELECT item_type, item_handle, item_order, include_flag, worked_example_mode,
+                       COALESCE(hide_name, false)
+                FROM tbl_exam_sheet_template_item
+                WHERE template_id = %s;
+            """, (template_id,))
+        for item_type, item_handle, order_val, include_flag, wem, hide_name in cur.fetchall():
+            key = (item_type, item_handle)
+            item_order_map[key] = order_val if order_val is not None else 0
+            item_include_map[key] = bool(include_flag)
+            worked_example_map[key] = wem
+            item_hide_name_map[key] = bool(hide_name)
+
+    cur.close()
+    conn.close()
+
+    topics = {}
+
+    for row in term_rows:
+        term_id, term_name, definition, display_order, topic_handle, topic_name, term_handle = row
+        item_handle = term_handle or f"term_id_{term_id}"
+        key = ("term", item_handle)
+        if key in item_include_map and not item_include_map[key]:
+            continue
+        if topic_handle in topic_include_map and not topic_include_map[topic_handle]:
+            continue
+        bucket = topics.setdefault(topic_handle, {
+            "topic_handle": topic_handle,
+            "topic_name": topic_name,
+            "terms": [],
+            "formulas": [],
+        })
+        bucket["terms"].append({
+            "term_id": term_id,
+            "term_handle": term_handle,
+            "term_name": term_name,
+            "definition": definition,
+            "hide_name": item_hide_name_map.get(key, False),
+            "_sort_display_order": display_order if display_order is not None else 10**9,
+            "_sort_item_order": item_order_map.get(key),
+        })
+
+    for row in formula_rows:
+        formula_id, formula_name, latex, display_order, topic_handle, topic_name, formula_handle, example = row
+        item_handle = formula_handle or f"formula_id_{formula_id}"
+        key = ("formula", item_handle)
+        if key in item_include_map and not item_include_map[key]:
+            continue
+        if topic_handle in topic_include_map and not topic_include_map[topic_handle]:
+            continue
+        bucket = topics.setdefault(topic_handle, {
+            "topic_handle": topic_handle,
+            "topic_name": topic_name,
+            "terms": [],
+            "formulas": [],
+        })
+        mode = worked_example_map.get(key, "auto")
+        include_example = (mode == "always") or (mode == "auto" and bool((example or "").strip()))
+        bucket["formulas"].append({
+            "id": formula_id,
+            "formula_handle": formula_handle,
+            "formula_name": formula_name,
+            "latex": latex,
+            "example": example if include_example else None,
+            "worked_example_mode": mode,
+            "hide_name": item_hide_name_map.get(key, False),
+            "_sort_display_order": display_order if display_order is not None else 10**9,
+            "_sort_item_order": item_order_map.get(key),
+        })
+
+    topic_list = list(topics.values())
+    topic_list.sort(key=lambda t: (
+        topic_order_map.get(t["topic_handle"], 10**9),
+        t["topic_name"].lower(),
+    ))
+
+    for topic in topic_list:
+        topic["terms"].sort(key=lambda item: (
+            item["_sort_item_order"] if item["_sort_item_order"] is not None else 10**9,
+            item["_sort_display_order"],
+            item["term_name"].lower(),
+        ))
+        topic["formulas"].sort(key=lambda item: (
+            item["_sort_item_order"] if item["_sort_item_order"] is not None else 10**9,
+            item["_sort_display_order"],
+            item["formula_name"].lower(),
+        ))
+        for item in topic["terms"]:
+            item.pop("_sort_display_order", None)
+            item.pop("_sort_item_order", None)
+        for item in topic["formulas"]:
+            item.pop("_sort_display_order", None)
+            item.pop("_sort_item_order", None)
+
+    return ({
+            "course_id": course_id,
+            "course_name": course_row[0],
+            "course_code": course_row[1],
+            "segment": segment,
+            "topics": topic_list,
+        }, None)
+
 @app.route('/api/exam_sheet/compile', methods=['POST'])
 def api_exam_sheet_compile():
     """Compile exam-sheet payload grouped by topic handle and item order."""
@@ -4220,167 +4387,56 @@ def api_exam_sheet_compile():
         else:
             template_id = None
 
-        conn = _auth_db()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT c.course_name, c.course_code
-            FROM tbl_user_course uc
-            JOIN tbl_course c ON c.course_id = uc.course_id
-            WHERE uc.user_id = %s AND uc.course_id = %s;
-        """, (user_id, course_id))
-        course_row = cur.fetchone()
-        if course_row is None:
-            cur.close()
-            conn.close()
-            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        payload, err = _get_exam_sheet_compile_payload(user_id, course_id, segment, template_id)
+        if err is not None:
+            return err[0], err[1]
+        return jsonify(payload)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-        cur.execute("""
-            SELECT t.term_id, t.term_name, t.definition, uct.display_order,
-                   COALESCE(NULLIF(TRIM(t.topic_handle), ''), 'uncategorized') AS topic_handle,
-                   COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
-                   t.term_handle
-            FROM tbl_user_course_term uct
-            JOIN tbl_term t ON t.term_id = uct.term_id
-            LEFT JOIN tbl_topic tp ON tp.topic_handle = t.topic_handle
-            WHERE uct.user_id = %s
-              AND uct.course_id = %s
-              AND (%s::text IS NULL OR TRIM(uct.segment_label) = TRIM(%s))
-            ORDER BY uct.display_order NULLS LAST, t.term_name;
-        """, (user_id, course_id, segment, segment))
-        term_rows = cur.fetchall()
 
-        cur.execute("""
-            SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order,
-                   COALESCE(NULLIF(TRIM(f.topic_handle), ''), 'uncategorized') AS topic_handle,
-                   COALESCE(tp.topic_name, 'Uncategorized') AS topic_name,
-                   f.formula_handle, f.example
-            FROM tbl_user_course_formula ucf
-            JOIN tbl_formula f ON f.formula_id = ucf.formula_id
-            LEFT JOIN tbl_topic tp ON tp.topic_handle = f.topic_handle
-            WHERE ucf.user_id = %s
-              AND ucf.course_id = %s
-              AND (%s::text IS NULL OR TRIM(ucf.segment_label) = TRIM(%s))
-            ORDER BY ucf.display_order NULLS LAST, f.formula_name;
-        """, (user_id, course_id, segment, segment))
-        formula_rows = cur.fetchall()
+@app.route('/api/exam_sheet/pdf', methods=['GET'])
+def api_exam_sheet_pdf():
+    """Generate exam-sheet PDF. Query params: template_id, course_id, segment (optional). Returns PDF with X-Pages-Total and X-Overflow headers."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        template_id = request.args.get("template_id")
+        course_id = request.args.get("course_id")
+        segment = (request.args.get("segment") or "").strip() or None
+        if not template_id or not course_id:
+            return jsonify({"error": "template_id and course_id are required"}), 400
+        try:
+            template_id = int(template_id)
+            course_id = int(course_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "template_id and course_id must be integers"}), 400
 
-        topic_order_map = {}
-        topic_include_map = {}
-        item_order_map = {}
-        item_include_map = {}
-        worked_example_map = {}
-        item_hide_name_map = {}
-        if template_id is not None:
-            cur.execute("""
-                SELECT topic_handle, topic_order, include_flag
-                FROM tbl_exam_sheet_template_topic
-                WHERE template_id = %s;
-            """, (template_id,))
-            for h, order_val, include_flag in cur.fetchall():
-                topic_order_map[h] = order_val if order_val is not None else 0
-                topic_include_map[h] = bool(include_flag)
+        payload, err = _get_exam_sheet_compile_payload(user_id, course_id, segment, template_id)
+        if err is not None:
+            return err[0], err[1]
 
-            cur.execute("""
-                SELECT item_type, item_handle, item_order, include_flag, worked_example_mode,
-                       COALESCE(hide_name, false)
-                FROM tbl_exam_sheet_template_item
-                WHERE template_id = %s;
-            """, (template_id,))
-            for item_type, item_handle, order_val, include_flag, wem, hide_name in cur.fetchall():
-                key = (item_type, item_handle)
-                item_order_map[key] = order_val if order_val is not None else 0
-                item_include_map[key] = bool(include_flag)
-                worked_example_map[key] = wem
-                item_hide_name_map[key] = bool(hide_name)
+        topics = payload.get("topics") or []
+        total_items = sum(
+            len(t.get("terms") or []) + len(t.get("formulas") or [])
+            for t in topics
+        )
+        from exam_sheet_pdf import render_print_html, html_to_pdf
+        html = render_print_html(payload)
+        pdf_bytes, page_count = html_to_pdf(html)
+        overflow = page_count > 2
 
-        cur.close()
-        conn.close()
-
-        topics = {}
-
-        for row in term_rows:
-            term_id, term_name, definition, display_order, topic_handle, topic_name, term_handle = row
-            item_handle = term_handle or f"term_id_{term_id}"
-            key = ("term", item_handle)
-            if key in item_include_map and not item_include_map[key]:
-                continue
-            if topic_handle in topic_include_map and not topic_include_map[topic_handle]:
-                continue
-            bucket = topics.setdefault(topic_handle, {
-                "topic_handle": topic_handle,
-                "topic_name": topic_name,
-                "terms": [],
-                "formulas": [],
-            })
-            bucket["terms"].append({
-                "term_id": term_id,
-                "term_handle": term_handle,
-                "term_name": term_name,
-                "definition": definition,
-                "hide_name": item_hide_name_map.get(key, False),
-                "_sort_display_order": display_order if display_order is not None else 10**9,
-                "_sort_item_order": item_order_map.get(key),
-            })
-
-        for row in formula_rows:
-            formula_id, formula_name, latex, display_order, topic_handle, topic_name, formula_handle, example = row
-            item_handle = formula_handle or f"formula_id_{formula_id}"
-            key = ("formula", item_handle)
-            if key in item_include_map and not item_include_map[key]:
-                continue
-            if topic_handle in topic_include_map and not topic_include_map[topic_handle]:
-                continue
-            bucket = topics.setdefault(topic_handle, {
-                "topic_handle": topic_handle,
-                "topic_name": topic_name,
-                "terms": [],
-                "formulas": [],
-            })
-            mode = worked_example_map.get(key, "auto")
-            include_example = (mode == "always") or (mode == "auto" and bool((example or "").strip()))
-            bucket["formulas"].append({
-                "id": formula_id,
-                "formula_handle": formula_handle,
-                "formula_name": formula_name,
-                "latex": latex,
-                "example": example if include_example else None,
-                "worked_example_mode": mode,
-                "hide_name": item_hide_name_map.get(key, False),
-                "_sort_display_order": display_order if display_order is not None else 10**9,
-                "_sort_item_order": item_order_map.get(key),
-            })
-
-        topic_list = list(topics.values())
-        topic_list.sort(key=lambda t: (
-            topic_order_map.get(t["topic_handle"], 10**9),
-            t["topic_name"].lower(),
-        ))
-
-        for topic in topic_list:
-            topic["terms"].sort(key=lambda item: (
-                item["_sort_item_order"] if item["_sort_item_order"] is not None else 10**9,
-                item["_sort_display_order"],
-                item["term_name"].lower(),
-            ))
-            topic["formulas"].sort(key=lambda item: (
-                item["_sort_item_order"] if item["_sort_item_order"] is not None else 10**9,
-                item["_sort_display_order"],
-                item["formula_name"].lower(),
-            ))
-            for item in topic["terms"]:
-                item.pop("_sort_display_order", None)
-                item.pop("_sort_item_order", None)
-            for item in topic["formulas"]:
-                item.pop("_sort_display_order", None)
-                item.pop("_sort_item_order", None)
-
-        return jsonify({
-            "course_id": course_id,
-            "course_name": course_row[0],
-            "course_code": course_row[1],
-            "segment": segment,
-            "topics": topic_list,
-        })
+        response = make_response(pdf_bytes)
+        response.headers["Content-Type"] = "application/pdf"
+        response.headers["Content-Disposition"] = "inline; filename=exam-sheet.pdf"
+        response.headers["X-Pages-Total"] = str(page_count)
+        response.headers["X-Overflow"] = "true" if overflow else "false"
+        response.headers["X-Exam-Sheet-Topics"] = str(len(topics))
+        response.headers["X-Exam-Sheet-Items"] = str(total_items)
+        response.headers["Access-Control-Expose-Headers"] = "X-Pages-Total, X-Overflow, X-Exam-Sheet-Topics, X-Exam-Sheet-Items"
+        return response
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
