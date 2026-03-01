@@ -9,10 +9,39 @@ The exam-sheet PDF is generated server-side with Playwright (headless Chromium).
 
 ## Heroku
 
-Playwright needs a Chromium binary. Options:
+The app uses `CHROMIUM_EXECUTABLE_PATH` when set (by the buildpack) and launches with `--no-sandbox` on Heroku.
 
-1. **Buildpack**: Use [heroku-buildpack-google-chrome](https://github.com/heroku/heroku-buildpack-google-chrome) or a Playwright buildpack so Chromium is available at runtime. Then set `PLAYWRIGHT_BROWSERS_PATH` or use the buildpack’s path.
+### 1. Add buildpacks (order matters)
 
-2. **Or** run `playwright install chromium` in the build phase (e.g. in a `bin/post_compile` or in the buildpack) so Chromium is installed in the slug.
+Python first, then the Playwright Python browsers buildpack, then the community buildpack for system deps:
+
+```bash
+# 1) Python (should already be set)
+heroku buildpacks:add -i 1 heroku/python -a linguaformula-backend
+
+# 2) Playwright Python – installs Chromium and sets CHROMIUM_EXECUTABLE_PATH
+heroku buildpacks:add -i 2 https://github.com/Thomas-Boi/heroku-playwright-python-browsers -a linguaformula-backend
+
+# 3) System dependencies for Chromium (required; playwright install --with-deps needs sudo)
+heroku buildpacks:add -i 3 https://github.com/playwright-community/heroku-playwright-buildpack -a linguaformula-backend
+```
+
+If buildpacks already exist, use `heroku buildpacks` to list and `heroku buildpacks:remove` then add in the right order.
+
+### 2. Config (optional, reduces slug size)
+
+```bash
+heroku config:set PLAYWRIGHT_BUILDPACK_BROWSERS=chromium -a linguaformula-backend
+```
+
+### 3. Redeploy
+
+After adding buildpacks and config, redeploy so the build runs with the new buildpacks:
+
+```bash
+cd backend/linguaformula
+git commit --allow-empty -m "Trigger rebuild for Playwright buildpacks"
+git push heroku main
+```
 
 Without Chromium on the server, `GET /api/exam_sheet/pdf` will fail at runtime when `html_to_pdf()` runs.

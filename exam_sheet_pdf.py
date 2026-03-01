@@ -122,12 +122,20 @@ def html_to_pdf(html_string):
     """
     Generate PDF from HTML using Playwright. Waits for MathJax to finish.
     Returns (pdf_bytes, page_count).
+    On Heroku, use CHROMIUM_EXECUTABLE_PATH from buildpack and disable sandbox.
     """
+    import os
     from playwright.sync_api import sync_playwright
     from pypdf import PdfReader
 
+    chromium_path = os.environ.get("CHROMIUM_EXECUTABLE_PATH")
+    launch_options = {}
+    if chromium_path:
+        launch_options["executable_path"] = chromium_path
+        launch_options["args"] = ["--no-sandbox", "--disable-setuid-sandbox"]
+
     with sync_playwright() as p:
-        browser = p.chromium.launch()
+        browser = p.chromium.launch(**launch_options)
         try:
             page = browser.new_page()
             page.set_content(html_string, wait_until="domcontentloaded")
