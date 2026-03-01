@@ -13,7 +13,7 @@ The app uses `CHROMIUM_EXECUTABLE_PATH` when set (by the buildpack) and launches
 
 ### 1. Add buildpacks (order matters)
 
-Python first, then the Playwright Python browsers buildpack, then the community buildpack for system deps:
+Python first, then the Playwright Python browsers buildpack. On **Heroku-24** we use only these two; the playwright-community buildpack requires heroku-18/20/22 so it is omitted.
 
 ```bash
 # 1) Python (should already be set)
@@ -21,12 +21,9 @@ heroku buildpacks:add -i 1 heroku/python -a linguaformula-backend
 
 # 2) Playwright Python – installs Chromium and sets CHROMIUM_EXECUTABLE_PATH
 heroku buildpacks:add -i 2 https://github.com/Thomas-Boi/heroku-playwright-python-browsers -a linguaformula-backend
-
-# 3) System dependencies for Chromium (required; playwright install --with-deps needs sudo)
-heroku buildpacks:add -i 3 https://github.com/playwright-community/heroku-playwright-buildpack -a linguaformula-backend
 ```
 
-If buildpacks already exist, use `heroku buildpacks` to list and `heroku buildpacks:remove` then add in the right order.
+If buildpacks already exist, use `heroku buildpacks` to list and `heroku buildpacks:remove` then add in the right order. Slug size will be ~350 MB (Chromium + headless shell).
 
 ### 2. Config (optional, reduces slug size)
 
