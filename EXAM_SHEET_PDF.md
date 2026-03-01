@@ -13,17 +13,20 @@ The app uses `CHROMIUM_EXECUTABLE_PATH` when set (by the buildpack) and launches
 
 ### 1. Add buildpacks (order matters)
 
-Python first, then the Playwright Python browsers buildpack. On **Heroku-24** we use only these two; the playwright-community buildpack requires heroku-18/20/22 so it is omitted.
+On **Heroku-24** use three buildpacks: Python, Apt (Chromium system libs), then Playwright Python browsers. Chromium needs system libraries (e.g. `libatk-1.0.so.0`); the Aptfile lists them so the apt buildpack installs them.
 
 ```bash
 # 1) Python (should already be set)
 heroku buildpacks:add -i 1 heroku/python -a linguaformula-backend
 
-# 2) Playwright Python – installs Chromium and sets CHROMIUM_EXECUTABLE_PATH
-heroku buildpacks:add -i 2 https://github.com/Thomas-Boi/heroku-playwright-python-browsers -a linguaformula-backend
+# 2) Apt – install Chromium shared library deps (see Aptfile)
+heroku buildpacks:add -i 2 https://github.com/heroku/heroku-buildpack-apt -a linguaformula-backend
+
+# 3) Playwright Python – installs Chromium and sets CHROMIUM_EXECUTABLE_PATH
+heroku buildpacks:add -i 3 https://github.com/Thomas-Boi/heroku-playwright-python-browsers -a linguaformula-backend
 ```
 
-If buildpacks already exist, use `heroku buildpacks` to list and `heroku buildpacks:remove` then add in the right order. Slug size will be ~350 MB (Chromium + headless shell).
+If buildpacks already exist, use `heroku buildpacks` to list and add/remove to get this order. The repo includes an `Aptfile` in `backend/linguaformula/` with the required packages for Ubuntu 24.04. Slug size will be ~350 MB (Chromium + headless shell).
 
 ### 2. Config (optional, reduces slug size)
 
