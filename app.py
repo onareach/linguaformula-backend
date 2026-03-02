@@ -3280,6 +3280,224 @@ def api_institutions_import():
     return jsonify({"inserted": inserted, "updated": updated})
 
 
+# ---------- Catalog courses (list auth; mutate admin) ----------
+@app.route('/api/catalog-courses', methods=['GET'])
+def api_catalog_courses_list():
+    """List all catalog courses (for dropdown when adding a course). Auth required."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT cc.catalog_course_id, cc.course_name, cc.course_code, cc.institution_id, cc.course_handle,
+                   i.institution_name
+            FROM tbl_catalog_course cc
+            LEFT JOIN tbl_institution i ON i.institution_id = cc.institution_id
+            ORDER BY cc.course_name;
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "catalog_courses": [
+                {
+                    "id": r[0],
+                    "course_name": r[1],
+                    "course_code": r[2],
+                    "institution_id": r[3],
+                    "course_handle": r[4],
+                    "institution_name": r[5],
+                }
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses', methods=['POST'])
+def api_catalog_courses_create():
+    """Create a catalog course (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    try:
+        data = request.get_json() or {}
+        name = (data.get("course_name") or "").strip()
+        if not name:
+            return jsonify({"error": "course_name is required"}), 400
+        code = (data.get("course_code") or "").strip() or None
+        institution_id = data.get("institution_id")
+        if institution_id is not None:
+            institution_id = int(institution_id)
+        handle = (data.get("course_handle") or "").strip() or None
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO tbl_catalog_course (course_name, course_code, institution_id, course_handle) VALUES (%s, %s, %s, %s) RETURNING catalog_course_id, course_name, course_code, institution_id, course_handle;",
+            (name, code, institution_id, handle),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "catalog_course": {
+                "id": row[0],
+                "course_name": row[1],
+                "course_code": row[2],
+                "institution_id": row[3],
+                "course_handle": row[4],
+            }
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>', methods=['PATCH'])
+def api_catalog_courses_update(catalog_course_id):
+    """Update a catalog course (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    updates = {}
+    if "course_name" in data or "name" in data:
+        s = (str(data.get("course_name") or data.get("name") or "")).strip()
+        if not s:
+            return jsonify({"error": "course_name cannot be empty"}), 400
+        updates["course_name"] = s
+    if "course_code" in data or "code" in data:
+        updates["course_code"] = (str(data.get("course_code") or data.get("code") or "")).strip() or None
+    if "institution_id" in data:
+        v = data.get("institution_id")
+        updates["institution_id"] = int(v) if v is not None else None
+    if "course_handle" in data or "handle" in data:
+        s = (str(data.get("course_handle") or data.get("handle") or "")).strip()
+        updates["course_handle"] = s if s else None
+    if not updates:
+        return jsonify({"error": "No fields to update"}), 400
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM tbl_catalog_course WHERE catalog_course_id = %s;", (catalog_course_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Catalog course not found"}), 404
+    set_parts = [f"{k} = %s" for k in updates]
+    set_parts.append("updated_at = CURRENT_TIMESTAMP")
+    vals = list(updates.values()) + [catalog_course_id]
+    try:
+        cur.execute(
+            f"UPDATE tbl_catalog_course SET {', '.join(set_parts)} WHERE catalog_course_id = %s RETURNING catalog_course_id, course_name, course_code, institution_id, course_handle;",
+            vals,
+        )
+        row = cur.fetchone()
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        if "course_handle" in str(e) or "unique" in str(e).lower():
+            cur.close()
+            conn.close()
+            return jsonify({"error": "course_handle already exists"}), 400
+        raise
+    cur.close()
+    conn.close()
+    return jsonify({
+        "catalog_course": {
+            "id": row[0],
+            "course_name": row[1],
+            "course_code": row[2],
+            "institution_id": row[3],
+            "course_handle": row[4],
+        }
+    })
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>', methods=['DELETE'])
+def api_catalog_courses_delete(catalog_course_id):
+    """Delete a catalog course (admin only). User courses referencing it get catalog_course_id set to NULL."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tbl_catalog_course WHERE catalog_course_id = %s RETURNING catalog_course_id;", (catalog_course_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Catalog course not found"}), 404
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"message": "Deleted"}), 200
+
+
+@app.route('/api/catalog-courses/import', methods=['POST'])
+def api_catalog_courses_import():
+    """Bulk import catalog courses from JSON (admin only). Match by course_handle."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    items = data.get("catalog_courses")
+    if not isinstance(items, list):
+        return jsonify({"error": "catalog_courses array required"}), 400
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("SELECT catalog_course_id, course_handle FROM tbl_catalog_course;")
+    rows_db = cur.fetchall()
+    handle_to_id = {(r[1].strip().lower() if r[1] else ""): r[0] for r in rows_db if r[1]}
+
+    inserted = 0
+    updated = 0
+    for i, row in enumerate(items):
+        if not isinstance(row, dict):
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({
+                "error": "Invalid file format.",
+                "details": [f"Record {i + 1} must be an object with course_name and optionally course_handle."]
+            }), 400
+        name = (str(row.get("course_name") or row.get("name") or "")).strip()
+        code = (str(row.get("course_code") or row.get("code") or "")).strip() or None
+        handle_raw = (str(row.get("course_handle") or row.get("handle") or "")).strip() or None
+        handle_key = (handle_raw or "").lower()
+        inst_id = row.get("institution_id")
+        if inst_id is not None:
+            inst_id = int(inst_id)
+        else:
+            inst_id = None
+        if not name:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({"error": f"Record {i + 1}: course_name is required."}), 400
+        match_id = handle_to_id.get(handle_key) if handle_key else None
+        if match_id is not None:
+            cur.execute(
+                "UPDATE tbl_catalog_course SET course_name = %s, course_code = %s, institution_id = %s, updated_at = CURRENT_TIMESTAMP WHERE catalog_course_id = %s;",
+                (name, code, inst_id, match_id),
+            )
+            updated += 1
+        else:
+            cur.execute(
+                "INSERT INTO tbl_catalog_course (course_name, course_code, institution_id, course_handle) VALUES (%s, %s, %s, %s) RETURNING catalog_course_id;",
+                (name, code, inst_id, handle_raw),
+            )
+            new_id = cur.fetchone()[0]
+            if handle_key:
+                handle_to_id[handle_key] = new_id
+            inserted += 1
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"inserted": inserted, "updated": updated})
+
+
 # ---------- Courses (auth required) ----------
 @app.route('/api/courses', methods=['GET'])
 def api_courses_list():
@@ -3322,30 +3540,54 @@ def api_courses_list():
 
 @app.route('/api/courses', methods=['POST'])
 def api_courses_create():
-    """Create a course and enroll the current user. Auth required."""
+    """Create a course and enroll the current user. Auth required. Optional catalog_course_id copies name/code/institution from catalog."""
     try:
         claims = _get_current_user()
         if not claims:
             return jsonify({"error": "Not authenticated"}), 401
         user_id = claims["user_id"]
         data = request.get_json() or {}
-        course_name = (data.get("course_name") or "").strip()
-        if not course_name:
-            return jsonify({"error": "course_name is required"}), 400
-        course_code = (data.get("course_code") or "").strip() or None
-        institution_id = data.get("institution_id")  # can be null for personal
-        if institution_id is not None:
-            institution_id = int(institution_id)
-        course_type = (data.get("course_type") or "").strip() or None
-        if not course_type and institution_id is None:
-            course_type = "personal"
-        elif not course_type:
-            course_type = "academic"
+        catalog_course_id = data.get("catalog_course_id")
+        if catalog_course_id is not None:
+            try:
+                catalog_course_id = int(catalog_course_id)
+            except (TypeError, ValueError):
+                catalog_course_id = None
         conn = _auth_db()
         cur = conn.cursor()
+        if catalog_course_id is not None:
+            cur.execute(
+                "SELECT course_name, course_code, institution_id FROM tbl_catalog_course WHERE catalog_course_id = %s;",
+                (catalog_course_id,),
+            )
+            cat_row = cur.fetchone()
+            if cat_row is None:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Catalog course not found"}), 404
+            course_name = (cat_row[0] or "").strip()
+            course_code = (cat_row[1] or "").strip() or None
+            institution_id = cat_row[2]
+            course_type = "academic" if institution_id else "personal"
+        else:
+            course_name = (data.get("course_name") or "").strip()
+            if not course_name:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "course_name is required"}), 400
+            course_code = (data.get("course_code") or "").strip() or None
+            institution_id = data.get("institution_id")
+            if institution_id is not None:
+                institution_id = int(institution_id)
+            course_type = (data.get("course_type") or "").strip() or None
+            if not course_type and institution_id is None:
+                course_type = "personal"
+            elif not course_type:
+                course_type = "academic"
         cur.execute(
-            "INSERT INTO tbl_course (course_name, course_code, institution_id, course_type) VALUES (%s, %s, %s, %s) RETURNING course_id, course_name, course_code, institution_id, course_type;",
-            (course_name, course_code, institution_id, course_type),
+            """INSERT INTO tbl_course (course_name, course_code, institution_id, course_type, catalog_course_id)
+               VALUES (%s, %s, %s, %s, %s) RETURNING course_id, course_name, course_code, institution_id, course_type;""",
+            (course_name, course_code, institution_id, course_type, catalog_course_id if catalog_course_id else None),
         )
         row = cur.fetchone()
         course_id = row[0]
