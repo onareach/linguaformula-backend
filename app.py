@@ -3498,6 +3498,446 @@ def api_catalog_courses_import():
     return jsonify({"inserted": inserted, "updated": updated})
 
 
+# ---------- Catalog course templates (terms/formulas per catalog course, admin only) ----------
+@app.route('/api/catalog-courses/<int:catalog_course_id>/terms', methods=['GET'])
+def api_catalog_course_terms_list(catalog_course_id):
+    """List template terms for a catalog course. Auth required (setup page)."""
+    claims, err = _get_current_user(), None
+    if not claims:
+        return jsonify({"error": "Not authenticated"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT cct.catalog_course_term_id, cct.term_id, t.term_name, t.definition,
+                   cct.segment_label, cct.display_order
+            FROM tbl_catalog_course_term cct
+            JOIN tbl_term t ON t.term_id = cct.term_id
+            WHERE cct.catalog_course_id = %s
+            ORDER BY cct.segment_label NULLS LAST, cct.display_order NULLS LAST, t.term_name;
+        """, (catalog_course_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "terms": [
+                {
+                    "catalog_course_term_id": r[0],
+                    "term_id": r[1],
+                    "term_name": r[2],
+                    "definition": r[3],
+                    "segment_label": r[4],
+                    "display_order": r[5],
+                }
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>/terms', methods=['POST'])
+def api_catalog_course_term_add(catalog_course_id):
+    """Add a term to a catalog course template (admin only). Body: term_id, segment_label (optional)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    try:
+        data = request.get_json() or {}
+        term_id = data.get("term_id")
+        if term_id is None:
+            return jsonify({"error": "term_id is required"}), 400
+        term_id = int(term_id)
+        segment_label = (data.get("segment_label") or data.get("segment") or "").strip() or None
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM tbl_catalog_course WHERE catalog_course_id = %s;", (catalog_course_id,))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Catalog course not found"}), 404
+        cur.execute("SELECT 1 FROM tbl_term WHERE term_id = %s;", (term_id,))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Term not found"}), 404
+        try:
+            cur.execute("""
+                INSERT INTO tbl_catalog_course_term (catalog_course_id, term_id, segment_label)
+                VALUES (%s, %s, %s)
+                RETURNING catalog_course_term_id;
+            """, (catalog_course_id, term_id, segment_label))
+            row_id = cur.fetchone()[0]
+            conn.commit()
+        except Exception as insert_err:
+            conn.rollback()
+            if "unique" in str(insert_err).lower() or "duplicate" in str(insert_err).lower():
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Term already in template for this segment"}), 400
+            raise
+        cur.execute("""
+            SELECT cct.catalog_course_term_id, cct.term_id, t.term_name, cct.segment_label
+            FROM tbl_catalog_course_term cct
+            JOIN tbl_term t ON t.term_id = cct.term_id
+            WHERE cct.catalog_course_term_id = %s;
+        """, (row_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "catalog_course_term_id": row[0],
+            "term_id": row[1],
+            "term_name": row[2],
+            "segment_label": row[3],
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>/terms/<int:catalog_course_term_id>', methods=['PATCH'])
+def api_catalog_course_term_update(catalog_course_id, catalog_course_term_id):
+    """Update segment for a catalog course template term (admin only). Body: segment_label (optional)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    segment_label = (data.get("segment_label") or data.get("segment") or "").strip() or None
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE tbl_catalog_course_term
+            SET segment_label = %s
+            WHERE catalog_course_term_id = %s AND catalog_course_id = %s
+            RETURNING catalog_course_term_id;
+        """, (segment_label, catalog_course_term_id, catalog_course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Template term not found"}), 404
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"message": "Segment updated"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>/terms/<int:catalog_course_term_id>', methods=['DELETE'])
+def api_catalog_course_term_remove(catalog_course_id, catalog_course_term_id):
+    """Remove a term from a catalog course template (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM tbl_catalog_course_term
+            WHERE catalog_course_term_id = %s AND catalog_course_id = %s
+            RETURNING catalog_course_term_id;
+        """, (catalog_course_term_id, catalog_course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Template term not found"}), 404
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"message": "Term removed from template"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>/formulas', methods=['GET'])
+def api_catalog_course_formulas_list(catalog_course_id):
+    """List template formulas for a catalog course. Auth required (setup page)."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Not authenticated"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT ccf.catalog_course_formula_id, ccf.formula_id, f.formula_name, f.latex,
+                   ccf.segment_label, ccf.display_order
+            FROM tbl_catalog_course_formula ccf
+            JOIN tbl_formula f ON f.formula_id = ccf.formula_id
+            WHERE ccf.catalog_course_id = %s
+            ORDER BY ccf.segment_label NULLS LAST, ccf.display_order NULLS LAST, f.formula_name;
+        """, (catalog_course_id,))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "formulas": [
+                {
+                    "catalog_course_formula_id": r[0],
+                    "formula_id": r[1],
+                    "formula_name": r[2],
+                    "latex": r[3],
+                    "segment_label": r[4],
+                    "display_order": r[5],
+                }
+                for r in rows
+            ]
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>/formulas', methods=['POST'])
+def api_catalog_course_formula_add(catalog_course_id):
+    """Add a formula to a catalog course template (admin only). Body: formula_id, segment_label (optional)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    try:
+        data = request.get_json() or {}
+        formula_id = data.get("formula_id")
+        if formula_id is None:
+            return jsonify({"error": "formula_id is required"}), 400
+        formula_id = int(formula_id)
+        segment_label = (data.get("segment_label") or data.get("segment") or "").strip() or None
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM tbl_catalog_course WHERE catalog_course_id = %s;", (catalog_course_id,))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Catalog course not found"}), 404
+        cur.execute("SELECT 1 FROM tbl_formula WHERE formula_id = %s;", (formula_id,))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Formula not found"}), 404
+        try:
+            cur.execute("""
+                INSERT INTO tbl_catalog_course_formula (catalog_course_id, formula_id, segment_label)
+                VALUES (%s, %s, %s)
+                RETURNING catalog_course_formula_id;
+            """, (catalog_course_id, formula_id, segment_label))
+            row_id = cur.fetchone()[0]
+            conn.commit()
+        except Exception as insert_err:
+            conn.rollback()
+            if "unique" in str(insert_err).lower() or "duplicate" in str(insert_err).lower():
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Formula already in template for this segment"}), 400
+            raise
+        cur.execute("""
+            SELECT ccf.catalog_course_formula_id, ccf.formula_id, f.formula_name, ccf.segment_label
+            FROM tbl_catalog_course_formula ccf
+            JOIN tbl_formula f ON f.formula_id = ccf.formula_id
+            WHERE ccf.catalog_course_formula_id = %s;
+        """, (row_id,))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "catalog_course_formula_id": row[0],
+            "formula_id": row[1],
+            "formula_name": row[2],
+            "segment_label": row[3],
+        }), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>/formulas/<int:catalog_course_formula_id>', methods=['PATCH'])
+def api_catalog_course_formula_update(catalog_course_id, catalog_course_formula_id):
+    """Update segment for a catalog course template formula (admin only). Body: segment_label (optional)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    segment_label = (data.get("segment_label") or data.get("segment") or "").strip() or None
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE tbl_catalog_course_formula
+            SET segment_label = %s
+            WHERE catalog_course_formula_id = %s AND catalog_course_id = %s
+            RETURNING catalog_course_formula_id;
+        """, (segment_label, catalog_course_formula_id, catalog_course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Template formula not found"}), 404
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"message": "Segment updated"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>/formulas/<int:catalog_course_formula_id>', methods=['DELETE'])
+def api_catalog_course_formula_remove(catalog_course_id, catalog_course_formula_id):
+    """Remove a formula from a catalog course template (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            DELETE FROM tbl_catalog_course_formula
+            WHERE catalog_course_formula_id = %s AND catalog_course_id = %s
+            RETURNING catalog_course_formula_id;
+        """, (catalog_course_formula_id, catalog_course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Template formula not found"}), 404
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({"message": "Formula removed from template"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>/template-export', methods=['GET'])
+def api_catalog_course_template_export(catalog_course_id):
+    """Export template terms and formulas for a catalog course using handles (cross-env safe). Auth required."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Not authenticated"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT course_handle FROM tbl_catalog_course WHERE catalog_course_id = %s;",
+            (catalog_course_id,),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Catalog course not found"}), 404
+        course_handle = row[0]
+        cur.execute("""
+            SELECT t.term_handle, cct.segment_label
+            FROM tbl_catalog_course_term cct
+            JOIN tbl_term t ON t.term_id = cct.term_id
+            WHERE cct.catalog_course_id = %s
+            ORDER BY cct.segment_label NULLS LAST, t.term_name;
+        """, (catalog_course_id,))
+        term_rows = cur.fetchall()
+        cur.execute("""
+            SELECT f.formula_handle, ccf.segment_label
+            FROM tbl_catalog_course_formula ccf
+            JOIN tbl_formula f ON f.formula_id = ccf.formula_id
+            WHERE ccf.catalog_course_id = %s
+            ORDER BY ccf.segment_label NULLS LAST, f.formula_name;
+        """, (catalog_course_id,))
+        formula_rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "catalog_course_handle": course_handle or "",
+            "terms": [
+                {"term_handle": r[0] or "", "segment_label": r[1] if r[1] else None}
+                for r in term_rows
+            ],
+            "formulas": [
+                {"formula_handle": r[0] or "", "segment_label": r[1] if r[1] else None}
+                for r in formula_rows
+            ],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/template-import', methods=['POST'])
+def api_catalog_course_template_import():
+    """Import template terms and formulas by handles (admin only). Match catalog_course by course_handle, terms by term_handle, formulas by formula_handle."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    course_handle_raw = (data.get("catalog_course_handle") or data.get("course_handle") or "").strip()
+    if not course_handle_raw:
+        return jsonify({"error": "catalog_course_handle is required"}), 400
+    terms_in = data.get("terms")
+    formulas_in = data.get("formulas")
+    if not isinstance(terms_in, list):
+        terms_in = []
+    if not isinstance(formulas_in, list):
+        formulas_in = []
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT catalog_course_id FROM tbl_catalog_course WHERE course_handle = %s;",
+            (course_handle_raw,),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": f"Catalog course not found for handle: {course_handle_raw!r}"}), 404
+        catalog_course_id = row[0]
+        cur.execute("SELECT term_id, term_handle FROM tbl_term WHERE term_handle IS NOT NULL AND TRIM(term_handle) != '';")
+        handle_to_term_id = {(r[1].strip().lower()): r[0] for r in cur.fetchall()}
+        cur.execute("SELECT formula_id, formula_handle FROM tbl_formula WHERE formula_handle IS NOT NULL AND TRIM(formula_handle) != '';")
+        handle_to_formula_id = {(r[1].strip().lower()): r[0] for r in cur.fetchall()}
+        inserted_terms = 0
+        inserted_formulas = 0
+        for item in terms_in:
+            if not isinstance(item, dict):
+                continue
+            th = (str(item.get("term_handle") or item.get("handle") or "")).strip()
+            if not th:
+                continue
+            term_id = handle_to_term_id.get(th.lower())
+            if term_id is None:
+                continue
+            seg = (str(item.get("segment_label") or item.get("segment") or "")).strip() or None
+            try:
+                cur.execute("""
+                    INSERT INTO tbl_catalog_course_term (catalog_course_id, term_id, segment_label)
+                    VALUES (%s, %s, %s);
+                """, (catalog_course_id, term_id, seg))
+                inserted_terms += 1
+            except Exception as ins_err:
+                if "unique" not in str(ins_err).lower() and "duplicate" not in str(ins_err).lower():
+                    raise
+        for item in formulas_in:
+            if not isinstance(item, dict):
+                continue
+            fh = (str(item.get("formula_handle") or item.get("handle") or "")).strip()
+            if not fh:
+                continue
+            formula_id = handle_to_formula_id.get(fh.lower())
+            if formula_id is None:
+                continue
+            seg = (str(item.get("segment_label") or item.get("segment") or "")).strip() or None
+            try:
+                cur.execute("""
+                    INSERT INTO tbl_catalog_course_formula (catalog_course_id, formula_id, segment_label)
+                    VALUES (%s, %s, %s);
+                """, (catalog_course_id, formula_id, seg))
+                inserted_formulas += 1
+            except Exception as ins_err:
+                if "unique" not in str(ins_err).lower() and "duplicate" not in str(ins_err).lower():
+                    raise
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "message": "Import complete",
+            "inserted_terms": inserted_terms,
+            "inserted_formulas": inserted_formulas,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------- Courses (auth required) ----------
 @app.route('/api/courses', methods=['GET'])
 def api_courses_list():
