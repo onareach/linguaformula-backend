@@ -3108,11 +3108,11 @@ def api_institutions_list():
 
 @app.route('/api/institutions', methods=['POST'])
 def api_institutions_create():
-    """Create an institution. Auth required."""
+    """Create an institution (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
     try:
-        claims = _get_current_user()
-        if not claims:
-            return jsonify({"error": "Not authenticated"}), 401
         data = request.get_json() or {}
         name = (data.get("institution_name") or "").strip()
         if not name:
@@ -3141,6 +3141,143 @@ def api_institutions_create():
         }), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/institutions/<int:institution_id>', methods=['PATCH'])
+def api_institutions_update(institution_id):
+    """Update an institution (admin only)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    updates = {}
+    if "institution_name" in data or "name" in data:
+        s = (str(data.get("institution_name") or data.get("name") or "")).strip()
+        if not s:
+            return jsonify({"error": "institution_name cannot be empty"}), 400
+        updates["institution_name"] = s
+    if "institution_handle" in data or "handle" in data:
+        s = (str(data.get("institution_handle") or data.get("handle") or "")).strip()
+        updates["institution_handle"] = s if s else None
+    if "country" in data:
+        updates["country"] = (str(data.get("country") or "")).strip() or None
+    if "region" in data:
+        updates["region"] = (str(data.get("region") or "")).strip() or None
+    if not updates:
+        return jsonify({"error": "No fields to update"}), 400
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM tbl_institution WHERE institution_id = %s;", (institution_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Institution not found"}), 404
+    set_parts = [f"{k} = %s" for k in updates]
+    set_parts.append("updated_at = CURRENT_TIMESTAMP")
+    vals = list(updates.values()) + [institution_id]
+    try:
+        cur.execute(
+            f"UPDATE tbl_institution SET {', '.join(set_parts)} WHERE institution_id = %s RETURNING institution_id, institution_name, institution_handle, country, region;",
+            vals,
+        )
+        row = cur.fetchone()
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        if "institution_handle" in str(e) or "unique" in str(e).lower():
+            cur.close()
+            conn.close()
+            return jsonify({"error": "institution_handle already exists"}), 400
+        raise
+    cur.close()
+    conn.close()
+    return jsonify({
+        "institution": {
+            "id": row[0],
+            "institution_name": row[1],
+            "institution_handle": row[2],
+            "country": row[3],
+            "region": row[4],
+        }
+    })
+
+
+@app.route('/api/institutions/<int:institution_id>', methods=['DELETE'])
+def api_institutions_delete(institution_id):
+    """Delete an institution (admin only). Courses referencing it get institution_id set to NULL."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM tbl_institution WHERE institution_id = %s RETURNING institution_id;", (institution_id,))
+    if cur.fetchone() is None:
+        cur.close()
+        conn.close()
+        return jsonify({"error": "Institution not found"}), 404
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"message": "Deleted"}), 200
+
+
+@app.route('/api/institutions/import', methods=['POST'])
+def api_institutions_import():
+    """Bulk import institutions from JSON (admin only). Match by institution_handle only; IDs not used (cross-env sync)."""
+    claims, err = _require_admin()
+    if err:
+        return err[0], err[1]
+    data = request.get_json() or {}
+    items = data.get("institutions")
+    if not isinstance(items, list):
+        return jsonify({"error": "institutions array required"}), 400
+    conn = _auth_db()
+    cur = conn.cursor()
+    cur.execute("SELECT institution_id, institution_handle FROM tbl_institution;")
+    rows_db = cur.fetchall()
+    handle_to_id = {(r[1].strip().lower() if r[1] else ""): r[0] for r in rows_db if r[1]}
+
+    inserted = 0
+    updated = 0
+    for i, row in enumerate(items):
+        if not isinstance(row, dict):
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({
+                "error": "Invalid file format.",
+                "details": [f"Record {i + 1} is not a valid object. Each institution must have institution_name and institution_handle."]
+            }), 400
+        name = (str(row.get("institution_name") or row.get("name") or "")).strip()
+        handle_raw = (str(row.get("institution_handle") or row.get("handle") or "")).strip() or None
+        handle_key = (handle_raw or "").lower()
+        country = (str(row.get("country") or "")).strip() or None
+        region = (str(row.get("region") or "")).strip() or None
+        if not name:
+            conn.rollback()
+            cur.close()
+            conn.close()
+            return jsonify({"error": f"Record {i + 1}: institution_name is required."}), 400
+        match_id = handle_to_id.get(handle_key) if handle_key else None
+        if match_id is not None:
+            cur.execute(
+                "UPDATE tbl_institution SET institution_name = %s, country = %s, region = %s, updated_at = CURRENT_TIMESTAMP WHERE institution_id = %s;",
+                (name, country, region, match_id),
+            )
+            updated += 1
+        else:
+            cur.execute(
+                "INSERT INTO tbl_institution (institution_name, institution_handle, country, region) VALUES (%s, %s, %s, %s) RETURNING institution_id;",
+                (name, handle_raw, country, region),
+            )
+            new_id = cur.fetchone()[0]
+            if handle_key:
+                handle_to_id[handle_key] = new_id
+            inserted += 1
+    conn.commit()
+    cur.close()
+    conn.close()
+    return jsonify({"inserted": inserted, "updated": updated})
 
 
 # ---------- Courses (auth required) ----------
