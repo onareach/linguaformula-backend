@@ -74,11 +74,22 @@ def _auth_db():
 
 def _create_jwt(user_id, email):
     payload = {"sub": user_id, "email": email, "exp": datetime.utcnow() + timedelta(days=7)}
-    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    raw = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    return raw if isinstance(raw, str) else raw.decode("utf-8")
+
+def _password_hash_bytes(stored):
+    """Normalize stored password hash to bytes for bcrypt.checkpw (DB may return str or bytes)."""
+    if stored is None:
+        return None
+    if isinstance(stored, bytes):
+        return stored
+    return stored.encode("utf-8")
 
 def _verify_jwt(token):
     if not token:
         return None
+    if isinstance(token, bytes):
+        token = token.decode("utf-8")
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         return {"user_id": payload["sub"], "email": payload["email"]}
@@ -2780,7 +2791,7 @@ def auth_register():
         resp = make_response(jsonify({"user": _user_response((row[0], row[1], row[2], False)), "token": token}))
         resp.set_cookie(
             AUTH_COOKIE_NAME,
-            token,
+            str(token),
             path="/",
             httponly=True,
             secure=request.is_secure or not app.debug,
@@ -2806,13 +2817,14 @@ def auth_login():
         row = cur.fetchone()
         cur.close()
         conn.close()
-        if not row or not bcrypt.checkpw(password.encode("utf-8"), row[3].encode("utf-8")):
+        pw_hash = _password_hash_bytes(row[3]) if row else None
+        if not row or not pw_hash or not bcrypt.checkpw(password.encode("utf-8"), pw_hash):
             return jsonify({"error": "Invalid email or password"}), 401
         token = _create_jwt(row[0], row[1])
         resp = make_response(jsonify({"user": _user_response((row[0], row[1], row[2], row[4])), "token": token}))
         resp.set_cookie(
             AUTH_COOKIE_NAME,
-            token,
+            str(token),
             path="/",
             httponly=True,
             secure=request.is_secure or not app.debug,
@@ -2877,7 +2889,8 @@ def auth_me_update():
                 return jsonify({"error": "New password must be at least 8 characters"}), 400
             cur.execute("SELECT password_hash FROM tbl_user WHERE user_id = %s;", (claims["user_id"],))
             row_pw = cur.fetchone()
-            if not row_pw or not bcrypt.checkpw(current_password.encode("utf-8"), row_pw[0].encode("utf-8")):
+            pw_hash = _password_hash_bytes(row_pw[0]) if row_pw else None
+            if not row_pw or not pw_hash or not bcrypt.checkpw(current_password.encode("utf-8"), pw_hash):
                 cur.close()
                 conn.close()
                 return jsonify({"error": "Current password is incorrect"}), 401
@@ -3873,7 +3886,7 @@ def api_catalog_course_template_import():
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute(
-            "SELECT catalog_course_id FROM tbl_catalog_course WHERE course_handle = %s;",
+            "SELECT catalog_course_id FROM tbl_catalog_course WHERE LOWER(TRIM(COALESCE(course_handle, ''))) = LOWER(TRIM(%s));",
             (course_handle_raw,),
         )
         row = cur.fetchone()
@@ -3886,8 +3899,24 @@ def api_catalog_course_template_import():
         handle_to_term_id = {(r[1].strip().lower()): r[0] for r in cur.fetchall()}
         cur.execute("SELECT formula_id, formula_handle FROM tbl_formula WHERE formula_handle IS NOT NULL AND TRIM(formula_handle) != '';")
         handle_to_formula_id = {(r[1].strip().lower()): r[0] for r in cur.fetchall()}
+        cur.execute(
+            "SELECT term_id, segment_label FROM tbl_catalog_course_term WHERE catalog_course_id = %s;",
+            (catalog_course_id,),
+        )
+        existing_terms = set((r[0], r[1]) for r in cur.fetchall())
+        cur.execute(
+            "SELECT formula_id, segment_label FROM tbl_catalog_course_formula WHERE catalog_course_id = %s;",
+            (catalog_course_id,),
+        )
+        existing_formulas = set((r[0], r[1]) for r in cur.fetchall())
         inserted_terms = 0
+        updated_terms = 0
+        terms_not_found = 0
         inserted_formulas = 0
+        updated_formulas = 0
+        formulas_not_found = 0
+        counted_updated_terms = set()
+        counted_updated_formulas = set()
         for item in terms_in:
             if not isinstance(item, dict):
                 continue
@@ -3896,17 +3925,28 @@ def api_catalog_course_template_import():
                 continue
             term_id = handle_to_term_id.get(th.lower())
             if term_id is None:
+                terms_not_found += 1
                 continue
             seg = (str(item.get("segment_label") or item.get("segment") or "")).strip() or None
-            try:
+            key_term = (term_id, seg)
+            if key_term in existing_terms:
+                cur.execute(
+                    """
+                    UPDATE tbl_catalog_course_term SET segment_label = %s
+                    WHERE catalog_course_id = %s AND term_id = %s AND (segment_label IS NOT DISTINCT FROM %s);
+                    """,
+                    (seg, catalog_course_id, term_id, seg),
+                )
+                if cur.rowcount > 0 and key_term not in counted_updated_terms:
+                    counted_updated_terms.add(key_term)
+                    updated_terms += 1
+            else:
                 cur.execute("""
                     INSERT INTO tbl_catalog_course_term (catalog_course_id, term_id, segment_label)
                     VALUES (%s, %s, %s);
                 """, (catalog_course_id, term_id, seg))
                 inserted_terms += 1
-            except Exception as ins_err:
-                if "unique" not in str(ins_err).lower() and "duplicate" not in str(ins_err).lower():
-                    raise
+                existing_terms.add(key_term)
         for item in formulas_in:
             if not isinstance(item, dict):
                 continue
@@ -3915,24 +3955,43 @@ def api_catalog_course_template_import():
                 continue
             formula_id = handle_to_formula_id.get(fh.lower())
             if formula_id is None:
+                formulas_not_found += 1
                 continue
             seg = (str(item.get("segment_label") or item.get("segment") or "")).strip() or None
-            try:
+            key_formula = (formula_id, seg)
+            if key_formula in existing_formulas:
+                cur.execute(
+                    """
+                    UPDATE tbl_catalog_course_formula SET segment_label = %s
+                    WHERE catalog_course_id = %s AND formula_id = %s AND (segment_label IS NOT DISTINCT FROM %s);
+                    """,
+                    (seg, catalog_course_id, formula_id, seg),
+                )
+                if cur.rowcount > 0 and key_formula not in counted_updated_formulas:
+                    counted_updated_formulas.add(key_formula)
+                    updated_formulas += 1
+            else:
                 cur.execute("""
                     INSERT INTO tbl_catalog_course_formula (catalog_course_id, formula_id, segment_label)
                     VALUES (%s, %s, %s);
                 """, (catalog_course_id, formula_id, seg))
                 inserted_formulas += 1
-            except Exception as ins_err:
-                if "unique" not in str(ins_err).lower() and "duplicate" not in str(ins_err).lower():
-                    raise
+                existing_formulas.add(key_formula)
         conn.commit()
         cur.close()
         conn.close()
+        inserted = inserted_terms + inserted_formulas
+        updated = updated_terms + updated_formulas
         return jsonify({
             "message": "Import complete",
+            "inserted": inserted,
+            "updated": updated,
             "inserted_terms": inserted_terms,
+            "updated_terms": updated_terms,
             "inserted_formulas": inserted_formulas,
+            "updated_formulas": updated_formulas,
+            "terms_not_found": terms_not_found,
+            "formulas_not_found": formulas_not_found,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
