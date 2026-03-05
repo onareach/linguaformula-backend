@@ -3137,6 +3137,9 @@ def _send_feedback_email(
         ])
     body_lines.append("")
     body_lines.append(f"Feedback ID: {feedback_id}")
+    if screenshot_base64:
+        body_lines.append("")
+        body_lines.append("--- Screenshot attached: feedback_{}.jpg ---".format(feedback_id))
     body_text = "\n".join(body_lines)
 
     payload = {
@@ -3223,6 +3226,10 @@ def api_feedback():
         page_url = (data.get("page_url") or "").strip() or None
         viewport = data.get("viewport") or {}
         screenshot_base64 = (data.get("screenshot_base64") or "").strip() or None
+        if screenshot_base64:
+            app.logger.info("Feedback screenshot received, length=%d", len(screenshot_base64))
+        else:
+            app.logger.info("Feedback received without screenshot")
 
         course_context = data.get("course_context")
         if course_context is not None:
