@@ -3169,6 +3169,7 @@ def _send_feedback_email(
     if sendgrid_key:
         try:
             import urllib.request
+            from urllib.error import HTTPError
             req = urllib.request.Request(
                 "https://api.sendgrid.com/v3/mail/send",
                 data=json.dumps(payload).encode(),
@@ -3179,6 +3180,10 @@ def _send_feedback_email(
                 ok = resp.status in (200, 202)
                 app.logger.info("Feedback email sent to %s (status=%s)", FEEDBACK_SUPPORT_EMAIL, resp.status)
                 return ok
+        except HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+            app.logger.warning("SendGrid feedback email failed: %s %s. Response: %s", e.code, e.reason, body[:500])
+            return False
         except Exception as e:
             app.logger.warning("SendGrid feedback email failed: %s", e)
             return False
