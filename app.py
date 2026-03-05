@@ -20,6 +20,7 @@ import bcrypt
 from datetime import datetime, timedelta
 import base64
 import re
+import uuid
 from PIL import Image
 import io
 import pytesseract
@@ -3087,6 +3088,257 @@ def auth_reset_password():
         return jsonify({"error": str(e)}), 500
 
 
+# ---------- Beta Feedback (auth required) ----------
+FEEDBACK_RATE_LIMIT_PER_HOUR = 5
+FEEDBACK_SUPPORT_EMAIL = "support@linguaformula.com"
+
+
+def _send_feedback_email(
+    message: str,
+    feedback_type: str,
+    user_id: int,
+    user_email: str,
+    page_url: str,
+    user_agent: str,
+    viewport: dict,
+    app_version: str,
+    course_context,
+    reward_opt_in: bool,
+    reward_contact: str,
+    reward_handle: str,
+    cc_user: bool,
+    feedback_id: str,
+    screenshot_base64: str | None = None,
+) -> bool:
+    """Send feedback email to support. Optionally CC user. Attach screenshot if provided."""
+    sendgrid_key = os.environ.get("SENDGRID_API_KEY")
+    from_email = os.environ.get("RESET_EMAIL_FROM", "noreply@example.com")
+    pathname = (page_url or "").split("?")[0] or "/"
+    subject = f"LF Beta Feedback: {feedback_type or 'Other'} — {pathname}"
+
+    body_lines = [
+        message,
+        "",
+        f"Type: {feedback_type or 'Other'}",
+        f"User ID: {user_id}",
+        f"User email: {user_email or '(none)'}",
+        f"Page URL: {page_url or '(none)'}",
+        f"User agent: {user_agent or '(none)'}",
+        f"Viewport: {viewport.get('width', '')} x {viewport.get('height', '')}",
+        f"App version: {app_version or 'unknown'}",
+        f"Course context: {course_context if course_context is not None else '(none)'}",
+    ]
+    if reward_opt_in:
+        body_lines.extend([
+            "",
+            "Reward opt-in: yes",
+            f"Reward contact: {reward_contact or '(none)'}",
+            f"Reward handle: {reward_handle or '(none)'}",
+        ])
+    body_lines.append("")
+    body_lines.append(f"Feedback ID: {feedback_id}")
+    body_text = "\n".join(body_lines)
+
+    payload = {
+        "personalizations": [{"to": [{"email": FEEDBACK_SUPPORT_EMAIL}]}],
+        "from": {"email": from_email, "name": "Lingua Formula"},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body_text}],
+    }
+
+    if cc_user and user_email:
+        payload["personalizations"][0]["cc"] = [{"email": user_email}]
+
+    bcc = (os.environ.get("SENDGRID_BCC") or "").strip()
+    if bcc:
+        payload["personalizations"][0]["bcc"] = [{"email": bcc}]
+
+    if screenshot_base64:
+        # Strip data URL prefix if present (e.g. "data:image/jpeg;base64,...")
+        if "," in screenshot_base64:
+            screenshot_base64 = screenshot_base64.split(",", 1)[1]
+        payload["attachments"] = [
+            {
+                "content": screenshot_base64,
+                "type": "image/jpeg",
+                "filename": f"feedback_{feedback_id}.jpg",
+                "disposition": "attachment",
+            }
+        ]
+
+    if sendgrid_key:
+        try:
+            import urllib.request
+            req = urllib.request.Request(
+                "https://api.sendgrid.com/v3/mail/send",
+                data=json.dumps(payload).encode(),
+                headers={"Authorization": f"Bearer {sendgrid_key}", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                ok = resp.status in (200, 202)
+                app.logger.info("Feedback email sent to %s (status=%s)", FEEDBACK_SUPPORT_EMAIL, resp.status)
+                return ok
+        except Exception as e:
+            app.logger.warning("SendGrid feedback email failed: %s", e)
+            return False
+    app.logger.warning("Feedback email NOT sent: SENDGRID_API_KEY not set. Preview: %s", body_text[:200])
+    return True
+
+
+@app.route("/api/feedback", methods=["POST"])
+def api_feedback():
+    """Submit beta feedback. Auth required. Rate limited. Honeypot for spam."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+
+        data = request.get_json()
+        if data is None:
+            return jsonify({"error": "Request body must be JSON"}), 400
+
+        # Honeypot: if "website" is filled, silently accept but do not store/send
+        website_honeypot = (data.get("website") or "").strip()
+        if website_honeypot:
+            return jsonify({"ok": True, "feedback_id": str(uuid.uuid4())}), 200
+
+        message = (data.get("message") or "").strip()
+        if len(message) < 5:
+            return jsonify({"error": "Message must be at least 5 characters"}), 400
+
+        feedback_type = (data.get("type") or data.get("feedback_type") or "").strip() or None
+        if feedback_type and feedback_type not in ("Bug", "Something confusing", "Suggestion", "Other"):
+            feedback_type = "Other"
+
+        cc_user = bool(data.get("cc_user", True))
+        reward_opt_in = bool(data.get("reward_opt_in", False))
+        reward_contact = (data.get("reward_contact") or "").strip() or None
+        reward_handle = (data.get("reward_handle") or "").strip() or None
+        page_url = (data.get("page_url") or "").strip() or None
+        viewport = data.get("viewport") or {}
+        screenshot_base64 = (data.get("screenshot_base64") or "").strip() or None
+
+        course_context = data.get("course_context")
+        if course_context is not None:
+            try:
+                course_context = int(course_context)
+            except (TypeError, ValueError):
+                course_context = None
+
+        # Default reward_contact to user email if opt-in
+        user_id = claims["user_id"]
+        user_email = claims.get("email") or ""
+        if reward_opt_in and not reward_contact and user_email:
+            reward_contact = user_email
+
+        user_agent = request.headers.get("User-Agent") or ""
+        app_version = os.environ.get("APP_VERSION") or os.environ.get("VERCEL_GIT_COMMIT_SHA") or "unknown"
+        if app_version == "unknown" and os.environ.get("FLASK_DEBUG"):
+            app_version = "local-dev"
+
+        viewport_width = viewport.get("width")
+        viewport_height = viewport.get("height")
+        if viewport_width is not None:
+            try:
+                viewport_width = int(viewport_width)
+            except (TypeError, ValueError):
+                viewport_width = None
+        if viewport_height is not None:
+            try:
+                viewport_height = int(viewport_height)
+            except (TypeError, ValueError):
+                viewport_height = None
+
+        conn = _auth_db()
+        cur = conn.cursor()
+
+        # Rate limit: max 5 per hour per user
+        cur.execute(
+            "SELECT COUNT(*) FROM tbl_feedback WHERE user_id = %s AND created_at > NOW() - INTERVAL '1 hour';",
+            (user_id,),
+        )
+        count = cur.fetchone()[0]
+        if count >= FEEDBACK_RATE_LIMIT_PER_HOUR:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "You've sent several feedback messages recently. Please wait an hour before sending more."}), 429
+
+        feedback_id = str(uuid.uuid4())
+        cur.execute(
+            """INSERT INTO tbl_feedback (
+                feedback_id, user_id, user_email, course_context, page_url, user_agent,
+                viewport_width, viewport_height, app_version, feedback_type, message,
+                cc_user, reward_opt_in, reward_contact, reward_handle
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s);""",
+            (
+                feedback_id,
+                user_id,
+                user_email or None,
+                course_context,
+                page_url,
+                user_agent[:4096] if user_agent else None,
+                viewport_width,
+                viewport_height,
+                app_version,
+                feedback_type,
+                message,
+                cc_user,
+                reward_opt_in,
+                reward_contact,
+                reward_handle,
+            ),
+        )
+
+        # Optionally save screenshot to disk (ephemeral on Heroku)
+        screenshot_path = None
+        if screenshot_base64:
+            try:
+                if "," in screenshot_base64:
+                    screenshot_base64_clean = screenshot_base64.split(",", 1)[1]
+                else:
+                    screenshot_base64_clean = screenshot_base64
+                img_data = base64.b64decode(screenshot_base64_clean)
+                if len(img_data) < 10 * 1024 * 1024:  # 10MB max
+                    feedback_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "feedback_screenshots")
+                    os.makedirs(feedback_dir, exist_ok=True)
+                    path = os.path.join(feedback_dir, f"{feedback_id}.jpg")
+                    with open(path, "wb") as f:
+                        f.write(img_data)
+                    screenshot_path = path
+                    cur.execute("UPDATE tbl_feedback SET screenshot_path = %s WHERE feedback_id = %s;", (screenshot_path, feedback_id))
+            except Exception as e:
+                app.logger.warning("Could not save feedback screenshot: %s", e)
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        # Send email (after DB persist so we don't lose the record)
+        _send_feedback_email(
+            message=message,
+            feedback_type=feedback_type or "Other",
+            user_id=user_id,
+            user_email=user_email,
+            page_url=page_url,
+            user_agent=user_agent,
+            viewport={"width": viewport_width, "height": viewport_height},
+            app_version=app_version,
+            course_context=course_context,
+            reward_opt_in=reward_opt_in,
+            reward_contact=reward_contact,
+            reward_handle=reward_handle,
+            cc_user=cc_user,
+            feedback_id=feedback_id,
+            screenshot_base64=screenshot_base64,
+        )
+
+        return jsonify({"ok": True, "feedback_id": feedback_id}), 200
+    except Exception as e:
+        app.logger.exception("Feedback submission failed")
+        return jsonify({"error": str(e)}), 500
+
+
 # ---------- Institutions (auth required) ----------
 @app.route('/api/institutions', methods=['GET'])
 def api_institutions_list():
@@ -4753,6 +5005,15 @@ def api_course_term_remove(course_id, term_id):
         return jsonify({"error": str(e)}), 500
 
 
+def _ensure_uncategorized_topic(cur):
+    """Ensure 'uncategorized' topic exists in tbl_topic (required by exam-sheet template FK)."""
+    cur.execute("""
+        INSERT INTO tbl_topic (topic_name, topic_handle)
+        VALUES ('Uncategorized', 'uncategorized')
+        ON CONFLICT (topic_handle) DO NOTHING;
+    """)
+
+
 def _load_exam_sheet_template_for_user(user_id, course_id, segment, template_id):
     """Return exam-sheet template topics/items (including include/order flags) for builder UI."""
     conn = _auth_db()
@@ -4937,6 +5198,7 @@ def api_exam_sheet_templates_list():
         except (TypeError, ValueError):
             return jsonify({"error": "course_id must be an integer"}), 400
         segment = (str(request.args.get("segment") or "")).strip() or None
+        all_segments = request.args.get("all_segments") in ("1", "true", "yes")
 
         conn = _auth_db()
         cur = conn.cursor()
@@ -4949,22 +5211,223 @@ def api_exam_sheet_templates_list():
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
 
-        cur.execute("""
-            SELECT template_id, template_name
-            FROM tbl_exam_sheet_template
-            WHERE course_id = %s
-              AND COALESCE(TRIM(segment_label), '') = COALESCE(TRIM(%s), '')
-            ORDER BY template_id;
-        """, (course_id, segment))
+        if all_segments:
+            cur.execute("""
+                SELECT template_id, template_name, segment_label
+                FROM tbl_exam_sheet_template
+                WHERE course_id = %s
+                ORDER BY COALESCE(TRIM(segment_label), ''), template_id;
+            """, (course_id,))
+            rows = cur.fetchall()
+            templates = [
+                {"template_id": r[0], "template_name": r[1] or "Unnamed", "segment_label": r[2]}
+                for r in rows
+            ]
+        else:
+            cur.execute("""
+                SELECT template_id, template_name
+                FROM tbl_exam_sheet_template
+                WHERE course_id = %s
+                  AND COALESCE(TRIM(segment_label), '') = COALESCE(TRIM(%s), '')
+                ORDER BY template_id;
+            """, (course_id, segment))
+            rows = cur.fetchall()
+            templates = [
+                {"template_id": r[0], "template_name": r[1] or "Unnamed"}
+                for r in rows
+            ]
+        cur.close()
+        conn.close()
+        return jsonify({"templates": templates})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/exam_sheet/templates_for_catalog', methods=['GET'])
+def api_exam_sheet_templates_for_catalog():
+    """List exam-sheet templates for a catalog course. Queries by catalog_course_id (direct or via course).
+    Auth required. Used to let users pick pre-configured sheet variants to copy into their course."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        catalog_course_id = request.args.get("catalog_course_id")
+        if catalog_course_id is None:
+            return jsonify({"error": "catalog_course_id is required"}), 400
+        try:
+            catalog_course_id = int(catalog_course_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "catalog_course_id must be an integer"}), 400
+        segment = (str(request.args.get("segment") or "")).strip() or None
+        segment_filter = segment is not None and segment != ""
+
+        conn = _auth_db()
+        cur = conn.cursor()
+        if segment_filter:
+            cur.execute("""
+                SELECT t.template_id, t.template_name, t.segment_label
+                FROM tbl_exam_sheet_template t
+                WHERE (t.catalog_course_id = %s OR (t.catalog_course_id IS NULL AND EXISTS (
+                    SELECT 1 FROM tbl_course c WHERE c.course_id = t.course_id AND c.catalog_course_id = %s
+                )))
+                  AND COALESCE(TRIM(t.segment_label), '') = COALESCE(TRIM(%s), '')
+                  AND (TRIM(COALESCE(t.template_name, '')) <> '' AND LOWER(TRIM(t.template_name)) <> 'unnamed')
+                ORDER BY t.template_id;
+            """, (catalog_course_id, catalog_course_id, segment))
+        else:
+            cur.execute("""
+                SELECT t.template_id, t.template_name, t.segment_label
+                FROM tbl_exam_sheet_template t
+                WHERE (t.catalog_course_id = %s OR (t.catalog_course_id IS NULL AND EXISTS (
+                    SELECT 1 FROM tbl_course c WHERE c.course_id = t.course_id AND c.catalog_course_id = %s
+                )))
+                  AND (TRIM(COALESCE(t.template_name, '')) <> '' AND LOWER(TRIM(t.template_name)) <> 'unnamed')
+                ORDER BY COALESCE(TRIM(t.segment_label), ''), t.template_id;
+            """, (catalog_course_id, catalog_course_id))
         rows = cur.fetchall()
         cur.close()
         conn.close()
 
         templates = [
-            {"template_id": r[0], "template_name": r[1] or "Unnamed"}
+            {"template_id": r[0], "template_name": r[1] or "Unnamed", "segment_label": r[2]}
             for r in rows
         ]
         return jsonify({"templates": templates})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/exam_sheet/segments_for_catalog', methods=['GET'])
+def api_exam_sheet_segments_for_catalog():
+    """List distinct segment_labels that have templates for a catalog course.
+    Auth required. Queries by catalog_course_id (direct or via course)."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        catalog_course_id = request.args.get("catalog_course_id")
+        if catalog_course_id is None:
+            return jsonify({"error": "catalog_course_id is required"}), 400
+        try:
+            catalog_course_id = int(catalog_course_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "catalog_course_id must be an integer"}), 400
+
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT COALESCE(TRIM(t.segment_label), '') AS seg
+            FROM tbl_exam_sheet_template t
+            WHERE (t.catalog_course_id = %s OR (t.catalog_course_id IS NULL AND EXISTS (
+                SELECT 1 FROM tbl_course c WHERE c.course_id = t.course_id AND c.catalog_course_id = %s
+            )))
+              AND (TRIM(COALESCE(t.template_name, '')) <> '' AND LOWER(TRIM(t.template_name)) <> 'unnamed')
+            ORDER BY seg;
+        """, (catalog_course_id, catalog_course_id))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        segments = [r[0] for r in rows]
+        return jsonify({"segments": segments})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/exam_sheet/template/copy-to-course', methods=['POST'])
+def api_exam_sheet_template_copy_to_course():
+    """Copy an exam-sheet template from a catalog course into the user's course.
+    Auth required. User must be enrolled in target course; source template must belong to a course
+    with the same catalog_course_id as the target course."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        data = request.get_json() or {}
+        source_template_id = data.get("source_template_id")
+        target_course_id = data.get("target_course_id")
+        template_name = (str(data.get("template_name") or "").strip()) or None
+
+        if source_template_id is None or target_course_id is None:
+            return jsonify({"error": "source_template_id and target_course_id are required"}), 400
+        try:
+            source_template_id = int(source_template_id)
+            target_course_id = int(target_course_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "source_template_id and target_course_id must be integers"}), 400
+
+        conn = _auth_db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course
+            WHERE user_id = %s AND course_id = %s;
+        """, (user_id, target_course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+
+        cur.execute("""
+            SELECT t.template_id, t.course_id, t.segment_label, t.template_name,
+                   COALESCE(t.catalog_course_id, c.catalog_course_id) AS source_catalog_id
+            FROM tbl_exam_sheet_template t
+            LEFT JOIN tbl_course c ON c.course_id = t.course_id
+            WHERE t.template_id = %s;
+        """, (source_template_id,))
+        row = cur.fetchone()
+        if row is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Source template not found"}), 404
+
+        _, source_course_id, segment_label, source_template_name, source_catalog_id = row
+        if source_catalog_id is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Source template must be from a catalog course"}), 400
+
+        cur.execute("""
+            SELECT catalog_course_id FROM tbl_course WHERE course_id = %s;
+        """, (target_course_id,))
+        target_row = cur.fetchone()
+        if target_row is None or target_row[0] != source_catalog_id:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Target course must have the same catalog course"}), 400
+
+        final_name = template_name or source_template_name or "Unnamed"
+
+        cur.execute("""
+            INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name, catalog_course_id)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING template_id;
+        """, (target_course_id, segment_label, user_id, final_name, source_catalog_id))
+        new_template_id = cur.fetchone()[0]
+
+        cur.execute("""
+            INSERT INTO tbl_exam_sheet_template_topic (template_id, topic_handle, topic_order, include_flag)
+            SELECT %s, topic_handle, topic_order, include_flag
+            FROM tbl_exam_sheet_template_topic
+            WHERE template_id = %s;
+        """, (new_template_id, source_template_id))
+        cur.execute("""
+            INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode, hide_name)
+            SELECT %s, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode, COALESCE(hide_name, false)
+            FROM tbl_exam_sheet_template_item
+            WHERE template_id = %s;
+        """, (new_template_id, source_template_id))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({
+            "template_id": new_template_id,
+            "template_name": final_name,
+            "message": "Exam sheet template added to your course",
+        }), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -5034,11 +5497,14 @@ def api_exam_sheet_template_initialize():
             if row:
                 template_id = row[0]
             else:
+                cur.execute("SELECT catalog_course_id FROM tbl_course WHERE course_id = %s;", (course_id,))
+                row_cc = cur.fetchone()
+                catalog_id = row_cc[0] if row_cc else None
                 cur.execute("""
-                    INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name)
-                    VALUES (%s, %s, %s, %s)
+                    INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name, catalog_course_id)
+                    VALUES (%s, %s, %s, %s, %s)
                     RETURNING template_id;
-                """, (course_id, segment, user_id, "Standard"))
+                """, (course_id, segment, user_id, "Standard", catalog_id))
                 template_id = cur.fetchone()[0]
 
         # Seed topics/items if template is empty
@@ -5049,6 +5515,7 @@ def api_exam_sheet_template_initialize():
         has_items = cur.fetchone()[0] > 0
 
         if not has_items:
+            _ensure_uncategorized_topic(cur)
             # Gather source items in default order
             cur.execute("""
                 SELECT t.term_id, t.term_name, t.definition, uct.display_order,
@@ -5176,6 +5643,8 @@ def api_exam_sheet_template_update():
         item_updates = data.get("item_updates") or []
         template_name = data.get("template_name")
 
+        if topic_updates:
+            _ensure_uncategorized_topic(cur)
         if template_name is not None:
             cur.execute("""
                 UPDATE tbl_exam_sheet_template
@@ -5263,11 +5732,14 @@ def api_exam_sheet_template_create():
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
 
+        cur.execute("SELECT catalog_course_id FROM tbl_course WHERE course_id = %s;", (course_id,))
+        row_cc = cur.fetchone()
+        catalog_id = row_cc[0] if row_cc else None
         cur.execute("""
-            INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name, catalog_course_id)
+            VALUES (%s, %s, %s, %s, %s)
             RETURNING template_id;
-        """, (course_id, segment, user_id, template_name))
+        """, (course_id, segment, user_id, template_name, catalog_id))
         new_template_id = cur.fetchone()[0]
 
         if copy_from_template_id is not None:
@@ -5276,6 +5748,7 @@ def api_exam_sheet_template_create():
             except (TypeError, ValueError):
                 copy_from_template_id = None
             if copy_from_template_id and copy_from_template_id != new_template_id:
+                _ensure_uncategorized_topic(cur)
                 cur.execute("""
                     SELECT 1 FROM tbl_exam_sheet_template
                     WHERE template_id = %s AND course_id = %s;
