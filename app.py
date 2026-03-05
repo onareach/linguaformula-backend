@@ -4010,7 +4010,7 @@ def api_courses_list():
         cur = conn.cursor()
         cur.execute("""
             SELECT c.course_id, c.course_name, c.course_code, c.institution_id, c.course_type,
-                   i.institution_name
+                   i.institution_name, c.catalog_course_id
             FROM tbl_user_course uc
             JOIN tbl_course c ON c.course_id = uc.course_id
             LEFT JOIN tbl_institution i ON i.institution_id = c.institution_id
@@ -4029,6 +4029,7 @@ def api_courses_list():
                     "institution_id": r[3],
                     "course_type": r[4],
                     "institution_name": r[5],
+                    "catalog_course_id": r[6],
                 }
                 for r in rows
             ]
@@ -4181,6 +4182,76 @@ def api_course_delete(course_id):
         cur.close()
         conn.close()
         return jsonify({"message": "Course removed"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/apply-template', methods=['POST'])
+def api_course_apply_template(course_id):
+    """Copy catalog course template (terms + formulas by segment) to the user's course. Auth required; course must have catalog_course_id."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT catalog_course_id FROM tbl_course c "
+            "JOIN tbl_user_course uc ON uc.course_id = c.course_id "
+            "WHERE uc.user_id = %s AND uc.course_id = %s;",
+            (user_id, course_id),
+        )
+        row = cur.fetchone()
+        if row is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        catalog_course_id = row[0]
+        if catalog_course_id is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "This course has no template. Use custom to add formulas and terms."}), 400
+        cur.execute("""
+            SELECT term_id, segment_label FROM tbl_catalog_course_term WHERE catalog_course_id = %s;
+        """, (catalog_course_id,))
+        term_rows = cur.fetchall()
+        cur.execute("""
+            SELECT formula_id, segment_label FROM tbl_catalog_course_formula WHERE catalog_course_id = %s;
+        """, (catalog_course_id,))
+        formula_rows = cur.fetchall()
+        inserted_terms = 0
+        inserted_formulas = 0
+        for term_id, seg in term_rows:
+            try:
+                cur.execute("""
+                    INSERT INTO tbl_user_course_term (user_id, course_id, term_id, segment_label)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, course_id, term_id) DO NOTHING;
+                """, (user_id, course_id, term_id, seg))
+                if cur.rowcount > 0:
+                    inserted_terms += 1
+            except Exception:
+                pass
+        for formula_id, seg in formula_rows:
+            try:
+                cur.execute("""
+                    INSERT INTO tbl_user_course_formula (user_id, course_id, formula_id, segment_label)
+                    VALUES (%s, %s, %s, %s)
+                    ON CONFLICT (user_id, course_id, formula_id) DO NOTHING;
+                """, (user_id, course_id, formula_id, seg))
+                if cur.rowcount > 0:
+                    inserted_formulas += 1
+            except Exception:
+                pass
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "message": "Template applied",
+            "inserted_terms": inserted_terms,
+            "inserted_formulas": inserted_formulas,
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -4698,6 +4769,14 @@ def _load_exam_sheet_template_for_user(user_id, course_id, segment, template_id)
         if course_row is None:
             return None, None
 
+        # Get template name
+        cur.execute("""
+            SELECT template_name FROM tbl_exam_sheet_template
+            WHERE template_id = %s AND course_id = %s;
+        """, (template_id, course_id))
+        t_row = cur.fetchone()
+        template_name = t_row[0] if t_row else None
+
         # Template-level topic and item flags
         topic_order_map = {}
         topic_include_map = {}
@@ -4833,12 +4912,61 @@ def _load_exam_sheet_template_for_user(user_id, course_id, segment, template_id)
             "course_code": course_row[1],
             "segment": segment,
             "template_id": template_id,
+            "template_name": template_name,
             "topics": topic_list,
         }
         return payload, None
     finally:
         cur.close()
         conn.close()
+
+
+@app.route('/api/exam_sheet/templates', methods=['GET'])
+def api_exam_sheet_templates_list():
+    """List exam-sheet templates for a course+segment. Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        course_id = request.args.get("course_id")
+        if course_id is None:
+            return jsonify({"error": "course_id is required"}), 400
+        try:
+            course_id = int(course_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "course_id must be an integer"}), 400
+        segment = (str(request.args.get("segment") or "")).strip() or None
+
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course
+            WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+
+        cur.execute("""
+            SELECT template_id, template_name
+            FROM tbl_exam_sheet_template
+            WHERE course_id = %s
+              AND COALESCE(TRIM(segment_label), '') = COALESCE(TRIM(%s), '')
+            ORDER BY template_id;
+        """, (course_id, segment))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        templates = [
+            {"template_id": r[0], "template_name": r[1] or "Unnamed"}
+            for r in rows
+        ]
+        return jsonify({"templates": templates})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route('/api/exam_sheet/template/initialize', methods=['POST'])
@@ -4858,6 +4986,12 @@ def api_exam_sheet_template_initialize():
         except (TypeError, ValueError):
             return jsonify({"error": "course_id must be an integer"}), 400
         segment = (str(data.get("segment") or "")).strip() or None
+        requested_template_id = data.get("template_id")
+        if requested_template_id is not None:
+            try:
+                requested_template_id = int(requested_template_id)
+            except (TypeError, ValueError):
+                requested_template_id = None
 
         conn = _auth_db()
         cur = conn.cursor()
@@ -4872,23 +5006,40 @@ def api_exam_sheet_template_initialize():
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
 
-        # Find or create template for this course+segment scope
-        cur.execute("""
-            SELECT template_id
-            FROM tbl_exam_sheet_template
-            WHERE course_id = %s
-              AND COALESCE(TRIM(segment_label), '') = COALESCE(TRIM(%s), '');
-        """, (course_id, segment))
-        row = cur.fetchone()
-        if row:
-            template_id = row[0]
-        else:
+        # If template_id provided, verify it belongs to this course+segment and use it
+        if requested_template_id is not None:
             cur.execute("""
-                INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name)
-                VALUES (%s, %s, %s, %s)
-                RETURNING template_id;
-            """, (course_id, segment, user_id, None))
-            template_id = cur.fetchone()[0]
+                SELECT template_id FROM tbl_exam_sheet_template
+                WHERE template_id = %s AND course_id = %s
+                  AND COALESCE(TRIM(segment_label), '') = COALESCE(TRIM(%s), '');
+            """, (requested_template_id, course_id, segment))
+            row = cur.fetchone()
+            if row:
+                template_id = row[0]
+            else:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Template not found"}), 404
+        else:
+            # Find first template or create one
+            cur.execute("""
+                SELECT template_id
+                FROM tbl_exam_sheet_template
+                WHERE course_id = %s
+                  AND COALESCE(TRIM(segment_label), '') = COALESCE(TRIM(%s), '')
+                ORDER BY template_id
+                LIMIT 1;
+            """, (course_id, segment))
+            row = cur.fetchone()
+            if row:
+                template_id = row[0]
+            else:
+                cur.execute("""
+                    INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name)
+                    VALUES (%s, %s, %s, %s)
+                    RETURNING template_id;
+                """, (course_id, segment, user_id, "Standard"))
+                template_id = cur.fetchone()[0]
 
         # Seed topics/items if template is empty
         cur.execute("""
@@ -5023,6 +5174,14 @@ def api_exam_sheet_template_update():
 
         topic_updates = data.get("topic_updates") or []
         item_updates = data.get("item_updates") or []
+        template_name = data.get("template_name")
+
+        if template_name is not None:
+            cur.execute("""
+                UPDATE tbl_exam_sheet_template
+                SET template_name = %s, updated_at = CURRENT_TIMESTAMP
+                WHERE template_id = %s;
+            """, (str(template_name).strip() or None, template_id))
 
         for tu in topic_updates:
             topic_handle = (tu.get("topic_handle") or "").strip()
@@ -5070,6 +5229,127 @@ def api_exam_sheet_template_update():
         return jsonify({"template_id": template_id, "message": "Template updated"}), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/exam_sheet/template/create', methods=['POST'])
+def api_exam_sheet_template_create():
+    """Create a new exam-sheet template variant. Optionally copy from an existing template."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        data = request.get_json() or {}
+        course_id = data.get("course_id")
+        if course_id is None:
+            return jsonify({"error": "course_id is required"}), 400
+        try:
+            course_id = int(course_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "course_id must be an integer"}), 400
+        segment = (str(data.get("segment") or "")).strip() or None
+        template_name = (str(data.get("template_name") or "Unnamed").strip()) or "Unnamed"
+        copy_from_template_id = data.get("copy_from_template_id")
+
+        conn = _auth_db()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course
+            WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+
+        cur.execute("""
+            INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name)
+            VALUES (%s, %s, %s, %s)
+            RETURNING template_id;
+        """, (course_id, segment, user_id, template_name))
+        new_template_id = cur.fetchone()[0]
+
+        if copy_from_template_id is not None:
+            try:
+                copy_from_template_id = int(copy_from_template_id)
+            except (TypeError, ValueError):
+                copy_from_template_id = None
+            if copy_from_template_id and copy_from_template_id != new_template_id:
+                cur.execute("""
+                    SELECT 1 FROM tbl_exam_sheet_template
+                    WHERE template_id = %s AND course_id = %s;
+                """, (copy_from_template_id, course_id))
+                if cur.fetchone():
+                    cur.execute("""
+                        INSERT INTO tbl_exam_sheet_template_topic (template_id, topic_handle, topic_order, include_flag)
+                        SELECT %s, topic_handle, topic_order, include_flag
+                        FROM tbl_exam_sheet_template_topic
+                        WHERE template_id = %s;
+                    """, (new_template_id, copy_from_template_id))
+                    cur.execute("""
+                        INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode, hide_name)
+                        SELECT %s, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode, COALESCE(hide_name, false)
+                        FROM tbl_exam_sheet_template_item
+                        WHERE template_id = %s;
+                    """, (new_template_id, copy_from_template_id))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({"template_id": new_template_id, "template_name": template_name, "message": "Template created"}), 201
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/exam_sheet/template', methods=['DELETE'])
+def api_exam_sheet_template_delete():
+    """Delete an exam-sheet template variant."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        template_id = request.args.get("template_id")
+        if template_id is None:
+            return jsonify({"error": "template_id is required"}), 400
+        try:
+            template_id = int(template_id)
+        except (TypeError, ValueError):
+            return jsonify({"error": "template_id must be an integer"}), 400
+
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT course_id FROM tbl_exam_sheet_template
+            WHERE template_id = %s;
+        """, (template_id,))
+        row = cur.fetchone()
+        if row is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Template not found"}), 404
+        course_id = row[0]
+
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course
+            WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+
+        cur.execute("DELETE FROM tbl_exam_sheet_template WHERE template_id = %s;", (template_id,))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return jsonify({"message": "Template deleted"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 
 
 def _get_exam_sheet_compile_payload(user_id, course_id, segment, template_id):
