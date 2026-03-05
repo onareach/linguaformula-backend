@@ -3149,8 +3149,8 @@ def _send_feedback_email(
     if cc_user and user_email:
         payload["personalizations"][0]["cc"] = [{"email": user_email}]
 
-    bcc = (os.environ.get("SENDGRID_BCC") or "").strip()
-    if bcc:
+    bcc = (os.environ.get("SENDGRID_BCC") or "").strip().lower()
+    if bcc and bcc != FEEDBACK_SUPPORT_EMAIL.lower() and bcc != (user_email or "").lower():
         payload["personalizations"][0]["bcc"] = [{"email": bcc}]
 
     if screenshot_base64:
