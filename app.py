@@ -3137,9 +3137,8 @@ def _send_feedback_email(
         ])
     body_lines.append("")
     body_lines.append(f"Feedback ID: {feedback_id}")
-    if screenshot_base64:
-        body_lines.append("")
-        body_lines.append("--- Screenshot attached: feedback_{}.jpg ---".format(feedback_id))
+    body_lines.append("")
+    body_lines.append("Screenshot: " + ("attached (feedback_{}.jpg)".format(feedback_id) if screenshot_base64 else "NOT RECEIVED (client capture may have failed)"))
     body_text = "\n".join(body_lines)
 
     payload = {
