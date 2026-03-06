@@ -3089,7 +3089,7 @@ def auth_reset_password():
 
 
 # ---------- Beta Feedback (auth required) ----------
-FEEDBACK_RATE_LIMIT_PER_HOUR = 5
+FEEDBACK_RATE_LIMIT_PER_HOUR = 20
 FEEDBACK_SUPPORT_EMAIL = "support@linguaformula.com"
 
 
@@ -3212,8 +3212,8 @@ def api_feedback():
             return jsonify({"ok": True, "feedback_id": str(uuid.uuid4())}), 200
 
         message = (data.get("message") or "").strip()
-        if len(message) < 5:
-            return jsonify({"error": "Message must be at least 5 characters"}), 400
+        if len(message) < 3:
+            return jsonify({"error": "Message must be at least 3 characters"}), 400
 
         feedback_type = (data.get("type") or data.get("feedback_type") or "").strip() or None
         if feedback_type and feedback_type not in ("Bug", "Something confusing", "Suggestion", "Other"):
@@ -3265,7 +3265,7 @@ def api_feedback():
         conn = _auth_db()
         cur = conn.cursor()
 
-        # Rate limit: max 5 per hour per user
+        # Rate limit: max 20 per hour per user (beta)
         cur.execute(
             "SELECT COUNT(*) FROM tbl_feedback WHERE user_id = %s AND created_at > NOW() - INTERVAL '1 hour';",
             (user_id,),
