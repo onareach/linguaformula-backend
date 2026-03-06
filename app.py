@@ -5310,8 +5310,9 @@ def api_exam_sheet_templates_for_catalog():
 
 @app.route('/api/exam_sheet/segments_for_catalog', methods=['GET'])
 def api_exam_sheet_segments_for_catalog():
-    """List distinct segment_labels that have templates for a catalog course.
-    Auth required. Queries by catalog_course_id (direct or via course)."""
+    """List distinct segment_labels for a catalog course.
+    Includes segments from: (1) exam_sheet_templates, (2) catalog course terms/formulas.
+    Auth required. Queries by catalog_course_id."""
     try:
         claims = _get_current_user()
         if not claims:
@@ -5326,6 +5327,7 @@ def api_exam_sheet_segments_for_catalog():
 
         conn = _auth_db()
         cur = conn.cursor()
+        # Segments from exam_sheet_templates (direct or via course)
         cur.execute("""
             SELECT DISTINCT COALESCE(TRIM(t.segment_label), '') AS seg
             FROM tbl_exam_sheet_template t
@@ -5333,13 +5335,22 @@ def api_exam_sheet_segments_for_catalog():
                 SELECT 1 FROM tbl_course c WHERE c.course_id = t.course_id AND c.catalog_course_id = %s
             )))
               AND (TRIM(COALESCE(t.template_name, '')) <> '' AND LOWER(TRIM(t.template_name)) <> 'unnamed')
-            ORDER BY seg;
         """, (catalog_course_id, catalog_course_id))
-        rows = cur.fetchall()
+        template_segs = {r[0] for r in cur.fetchall()}
+        # Segments from catalog course terms and formulas
+        cur.execute("""
+            SELECT DISTINCT COALESCE(TRIM(segment_label), '') AS seg
+            FROM (
+                SELECT segment_label FROM tbl_catalog_course_term WHERE catalog_course_id = %s
+                UNION
+                SELECT segment_label FROM tbl_catalog_course_formula WHERE catalog_course_id = %s
+            ) x
+        """, (catalog_course_id, catalog_course_id))
+        catalog_segs = {r[0] for r in cur.fetchall()}
         cur.close()
         conn.close()
 
-        segments = [r[0] for r in rows]
+        segments = sorted(template_segs | catalog_segs)
         return jsonify({"segments": segments})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
