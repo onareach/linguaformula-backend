@@ -5281,8 +5281,7 @@ def api_exam_sheet_templates_for_catalog():
                 WHERE (t.catalog_course_id = %s OR (t.catalog_course_id IS NULL AND EXISTS (
                     SELECT 1 FROM tbl_course c WHERE c.course_id = t.course_id AND c.catalog_course_id = %s
                 )))
-                  AND COALESCE(TRIM(t.segment_label), '') = COALESCE(TRIM(%s), '')
-                  AND (TRIM(COALESCE(t.template_name, '')) <> '' AND LOWER(TRIM(t.template_name)) <> 'unnamed')
+                  AND LOWER(TRIM(COALESCE(t.segment_label, ''))) = LOWER(TRIM(%s))
                 ORDER BY t.template_id;
             """, (catalog_course_id, catalog_course_id, segment))
         else:
@@ -5292,7 +5291,6 @@ def api_exam_sheet_templates_for_catalog():
                 WHERE (t.catalog_course_id = %s OR (t.catalog_course_id IS NULL AND EXISTS (
                     SELECT 1 FROM tbl_course c WHERE c.course_id = t.course_id AND c.catalog_course_id = %s
                 )))
-                  AND (TRIM(COALESCE(t.template_name, '')) <> '' AND LOWER(TRIM(t.template_name)) <> 'unnamed')
                 ORDER BY COALESCE(TRIM(t.segment_label), ''), t.template_id;
             """, (catalog_course_id, catalog_course_id))
         rows = cur.fetchall()
