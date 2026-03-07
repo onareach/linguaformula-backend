@@ -3137,7 +3137,7 @@ def _send_feedback_email(
             "",
             "Reward opt-in: yes",
             f"Reward contact: {reward_contact or '(none)'}",
-            f"Reward handle: {reward_handle or '(none)'}",
+            f"Reward (method: handle): {reward_handle or '(none)'}",
         ])
     body_lines.append("")
     body_lines.append(f"Feedback ID: {feedback_id}")
@@ -3221,7 +3221,13 @@ def api_feedback():
         cc_user = bool(data.get("cc_user", True))
         reward_opt_in = bool(data.get("reward_opt_in", False))
         reward_contact = (data.get("reward_contact") or "").strip() or None
-        reward_handle = (data.get("reward_handle") or "").strip() or None
+        reward_service = (data.get("reward_service") or "").strip() or None
+        reward_handle_raw = (data.get("reward_handle") or "").strip() or None
+        # Store "Service: value" in reward_handle so support knows both (no DB migration)
+        if reward_service and reward_handle_raw:
+            reward_handle = f"{reward_service}: {reward_handle_raw}"
+        else:
+            reward_handle = reward_handle_raw
         page_url = (data.get("page_url") or "").strip() or None
         viewport = data.get("viewport") or {}
         screenshot_base64 = (data.get("screenshot_base64") or "").strip() or None
