@@ -3088,15 +3088,19 @@ def auth_reset_password():
         return jsonify({"error": str(e)}), 500
 
 
-# ---------- Beta Feedback (auth required) ----------
+# ---------- Beta Feedback ----------
 FEEDBACK_RATE_LIMIT_PER_HOUR = 20
+FEEDBACK_GUEST_RATE_LIMIT_PER_HOUR = 5  # Stricter for unauthenticated (IP + email)
 FEEDBACK_SUPPORT_EMAIL = "support@linguaformula.com"
+
+# Basic email format for guest validation (RFC 5322 simplified)
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$")
 
 
 def _send_feedback_email(
     message: str,
     feedback_type: str,
-    user_id: int,
+    user_id: int | None,
     user_email: str,
     page_url: str,
     user_agent: str,
@@ -3120,7 +3124,7 @@ def _send_feedback_email(
         message,
         "",
         f"Type: {feedback_type or 'Other'}",
-        f"User ID: {user_id}",
+        f"User ID: {user_id if user_id is not None else 'guest'}",
         f"User email: {user_email or '(none)'}",
         f"Page URL: {page_url or '(none)'}",
         f"User agent: {user_agent or '(none)'}",
@@ -3195,12 +3199,8 @@ def _send_feedback_email(
 
 @app.route("/api/feedback", methods=["POST"])
 def api_feedback():
-    """Submit beta feedback. Auth required. Rate limited. Honeypot for spam."""
+    """Submit beta feedback. Auth or guest_email required. Rate limited. Honeypot for spam."""
     try:
-        claims = _get_current_user()
-        if not claims:
-            return jsonify({"error": "Not authenticated"}), 401
-
         data = request.get_json()
         if data is None:
             return jsonify({"error": "Request body must be JSON"}), 400
@@ -3237,11 +3237,23 @@ def api_feedback():
             except (TypeError, ValueError):
                 course_context = None
 
-        # Default reward_contact to user email if opt-in
-        user_id = claims["user_id"]
-        user_email = claims.get("email") or ""
-        if reward_opt_in and not reward_contact and user_email:
-            reward_contact = user_email
+        claims = _get_current_user()
+        user_id = None
+        user_email = ""
+
+        if claims:
+            user_id = claims["user_id"]
+            user_email = claims.get("email") or ""
+            if reward_opt_in and not reward_contact and user_email:
+                reward_contact = user_email
+        else:
+            # Guest: require guest_email
+            guest_email = (data.get("guest_email") or "").strip()
+            if not guest_email:
+                return jsonify({"error": "Email address is required when not signed in."}), 400
+            if not _EMAIL_RE.match(guest_email):
+                return jsonify({"error": "Please enter a valid email address."}), 400
+            user_email = guest_email
 
         user_agent = request.headers.get("User-Agent") or ""
         app_version = os.environ.get("APP_VERSION") or os.environ.get("VERCEL_GIT_COMMIT_SHA") or "unknown"
@@ -3264,16 +3276,37 @@ def api_feedback():
         conn = _auth_db()
         cur = conn.cursor()
 
-        # Rate limit: max 20 per hour per user (beta)
-        cur.execute(
-            "SELECT COUNT(*) FROM tbl_feedback WHERE user_id = %s AND created_at > NOW() - INTERVAL '1 hour';",
-            (user_id,),
-        )
-        count = cur.fetchone()[0]
-        if count >= FEEDBACK_RATE_LIMIT_PER_HOUR:
-            cur.close()
-            conn.close()
-            return jsonify({"error": "You've sent several feedback messages recently. Please wait an hour before sending more."}), 429
+        if user_id is not None:
+            # Rate limit: max 20 per hour per authenticated user
+            cur.execute(
+                "SELECT COUNT(*) FROM tbl_feedback WHERE user_id = %s AND created_at > NOW() - INTERVAL '1 hour';",
+                (user_id,),
+            )
+            count = cur.fetchone()[0]
+            if count >= FEEDBACK_RATE_LIMIT_PER_HOUR:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "You've sent several feedback messages recently. Please wait an hour before sending more."}), 429
+        else:
+            # Guest rate limit: by email (5/hour) and global guest cap (20/hour)
+            cur.execute(
+                "SELECT COUNT(*) FROM tbl_feedback WHERE user_id IS NULL AND user_email = %s AND created_at > NOW() - INTERVAL '1 hour';",
+                (user_email,),
+            )
+            count_by_email = cur.fetchone()[0]
+            cur.execute(
+                "SELECT COUNT(*) FROM tbl_feedback WHERE user_id IS NULL AND created_at > NOW() - INTERVAL '1 hour';",
+                (),
+            )
+            total_guests_last_hour = cur.fetchone()[0]
+            if count_by_email >= FEEDBACK_GUEST_RATE_LIMIT_PER_HOUR:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "You've sent several feedback messages from this email recently. Please wait an hour before sending more."}), 429
+            if total_guests_last_hour >= FEEDBACK_GUEST_RATE_LIMIT_PER_HOUR * 4:  # 20 total guests/hour as global cap
+                cur.close()
+                conn.close()
+                return jsonify({"error": "We're receiving many feedback messages right now. Please try again in an hour."}), 429
 
         feedback_id = str(uuid.uuid4())
         cur.execute(
@@ -5254,9 +5287,69 @@ def api_exam_sheet_templates_list():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/exam_sheet/my-sheets', methods=['GET'])
+def api_exam_sheet_my_sheets():
+    """List templates and custom sheets for the user's enrolled courses.
+    Returns template_id, template_name, course_name, segment_label, is_custom (source IN variant,scratch)."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+
+        conn = _auth_db()
+        cur = conn.cursor()
+
+        # Check if source column exists (migration may not have run yet)
+        cur.execute("""
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = 'public' AND table_name = 'tbl_exam_sheet_template' AND column_name = 'source';
+        """)
+        has_source = cur.fetchone() is not None
+
+        if has_source:
+            cur.execute("""
+                SELECT t.template_id, t.template_name, c.course_id, c.course_name, COALESCE(t.segment_label, '') AS segment_label,
+                       t.source IN ('variant', 'scratch') AS is_custom
+                FROM tbl_exam_sheet_template t
+                JOIN tbl_course c ON c.course_id = t.course_id
+                JOIN tbl_user_course uc ON uc.course_id = c.course_id AND uc.user_id = %s
+                ORDER BY c.course_name, t.segment_label, t.template_id;
+            """, (user_id,))
+        else:
+            # Fallback when source column doesn't exist: treat user-created as custom
+            cur.execute("""
+                SELECT t.template_id, t.template_name, c.course_id, c.course_name, COALESCE(t.segment_label, '') AS segment_label,
+                       (t.created_by_user_id = %s) AS is_custom
+                FROM tbl_exam_sheet_template t
+                JOIN tbl_course c ON c.course_id = t.course_id
+                JOIN tbl_user_course uc ON uc.course_id = c.course_id AND uc.user_id = %s
+                ORDER BY c.course_name, t.segment_label, t.template_id;
+            """, (user_id, user_id))
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        sheets = [
+            {
+                "template_id": r[0],
+                "template_name": r[1] or "Unnamed",
+                "course_id": r[2],
+                "course_name": r[3],
+                "segment_label": r[4],
+                "is_custom": bool(r[5]),
+            }
+            for r in rows
+        ]
+        return jsonify({"sheets": sheets})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/exam_sheet/templates_for_catalog', methods=['GET'])
 def api_exam_sheet_templates_for_catalog():
     """List exam-sheet templates for a catalog course. Queries by catalog_course_id (direct or via course).
+    Also includes templates for course_id when provided (so user's own templates appear).
     Auth required. Used to let users pick pre-configured sheet variants to copy into their course."""
     try:
         claims = _get_current_user()
@@ -5269,30 +5362,51 @@ def api_exam_sheet_templates_for_catalog():
             catalog_course_id = int(catalog_course_id)
         except (TypeError, ValueError):
             return jsonify({"error": "catalog_course_id must be an integer"}), 400
+        course_id_arg = request.args.get("course_id")
+        course_id = None
+        if course_id_arg is not None:
+            try:
+                course_id = int(course_id_arg)
+            except (TypeError, ValueError):
+                pass
         segment = (str(request.args.get("segment") or "")).strip() or None
         segment_filter = segment is not None and segment != ""
 
         conn = _auth_db()
         cur = conn.cursor()
+        # Catalog match: template.catalog_course_id or template's course has catalog_course_id
+        # Also include templates for the selected course (user's own templates)
+        catalog_match = (
+            "t.catalog_course_id = %s OR (t.catalog_course_id IS NULL AND EXISTS ("
+            "SELECT 1 FROM tbl_course c WHERE c.course_id = t.course_id AND c.catalog_course_id = %s"
+            "))"
+        )
+        course_match = "t.course_id = %s" if course_id is not None else "FALSE"
+        where_catalog = f"({catalog_match} OR {course_match})"
+        params_base = [catalog_course_id, catalog_course_id]
+        if course_id is not None:
+            params_base.append(course_id)
         if segment_filter:
-            cur.execute("""
+            cur.execute(
+                f"""
                 SELECT t.template_id, t.template_name, t.segment_label
                 FROM tbl_exam_sheet_template t
-                WHERE (t.catalog_course_id = %s OR (t.catalog_course_id IS NULL AND EXISTS (
-                    SELECT 1 FROM tbl_course c WHERE c.course_id = t.course_id AND c.catalog_course_id = %s
-                )))
+                WHERE {where_catalog}
                   AND LOWER(TRIM(COALESCE(t.segment_label, ''))) = LOWER(TRIM(%s))
                 ORDER BY t.template_id;
-            """, (catalog_course_id, catalog_course_id, segment))
+                """,
+                params_base + [segment],
+            )
         else:
-            cur.execute("""
+            cur.execute(
+                f"""
                 SELECT t.template_id, t.template_name, t.segment_label
                 FROM tbl_exam_sheet_template t
-                WHERE (t.catalog_course_id = %s OR (t.catalog_course_id IS NULL AND EXISTS (
-                    SELECT 1 FROM tbl_course c WHERE c.course_id = t.course_id AND c.catalog_course_id = %s
-                )))
+                WHERE {where_catalog}
                 ORDER BY COALESCE(TRIM(t.segment_label), ''), t.template_id;
-            """, (catalog_course_id, catalog_course_id))
+                """,
+                params_base,
+            )
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -5420,8 +5534,8 @@ def api_exam_sheet_template_copy_to_course():
         final_name = template_name or source_template_name or "Unnamed"
 
         cur.execute("""
-            INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name, catalog_course_id)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name, catalog_course_id, source, parent_template_id)
+            VALUES (%s, %s, %s, %s, %s, 'catalog', NULL)
             RETURNING template_id;
         """, (target_course_id, segment_label, user_id, final_name, source_catalog_id))
         new_template_id = cur.fetchone()[0]
@@ -5520,11 +5634,14 @@ def api_exam_sheet_template_initialize():
                 cur.execute("SELECT catalog_course_id FROM tbl_course WHERE course_id = %s;", (course_id,))
                 row_cc = cur.fetchone()
                 catalog_id = row_cc[0] if row_cc else None
+                cur.execute("SELECT is_admin FROM tbl_user WHERE user_id = %s;", (user_id,))
+                admin_row = cur.fetchone()
+                init_source = 'admin' if (admin_row and admin_row[0]) else 'scratch'
                 cur.execute("""
-                    INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name, catalog_course_id)
-                    VALUES (%s, %s, %s, %s, %s)
+                    INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name, catalog_course_id, source, parent_template_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, NULL)
                     RETURNING template_id;
-                """, (course_id, segment, user_id, "Standard", catalog_id))
+                """, (course_id, segment, user_id, "Standard", catalog_id, init_source))
                 template_id = cur.fetchone()[0]
 
         # Seed topics/items if template is empty
@@ -5640,7 +5757,7 @@ def api_exam_sheet_template_update():
 
         # Verify template belongs to a course the user is enrolled in
         cur.execute("""
-            SELECT course_id FROM tbl_exam_sheet_template
+            SELECT course_id, source, created_by_user_id FROM tbl_exam_sheet_template
             WHERE template_id = %s;
         """, (template_id,))
         row = cur.fetchone()
@@ -5648,7 +5765,7 @@ def api_exam_sheet_template_update():
             cur.close()
             conn.close()
             return jsonify({"error": "Template not found"}), 404
-        course_id = row[0]
+        course_id, t_source, t_created_by = row
 
         cur.execute("""
             SELECT 1 FROM tbl_user_course
@@ -5658,6 +5775,16 @@ def api_exam_sheet_template_update():
             cur.close()
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
+
+        # Restrict PATCH to custom sheets unless user is admin
+        cur.execute("SELECT is_admin FROM tbl_user WHERE user_id = %s;", (user_id,))
+        admin_row = cur.fetchone()
+        is_admin = bool(admin_row and admin_row[0])
+        if not is_admin:
+            if t_source not in ('variant', 'scratch') or t_created_by != user_id:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "Only your custom sheets can be edited"}), 403
 
         topic_updates = data.get("topic_updates") or []
         item_updates = data.get("item_updates") or []
@@ -5755,37 +5882,50 @@ def api_exam_sheet_template_create():
         cur.execute("SELECT catalog_course_id FROM tbl_course WHERE course_id = %s;", (course_id,))
         row_cc = cur.fetchone()
         catalog_id = row_cc[0] if row_cc else None
-        cur.execute("""
-            INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name, catalog_course_id)
-            VALUES (%s, %s, %s, %s, %s)
-            RETURNING template_id;
-        """, (course_id, segment, user_id, template_name, catalog_id))
-        new_template_id = cur.fetchone()[0]
-
+        cur.execute("SELECT is_admin FROM tbl_user WHERE user_id = %s;", (user_id,))
+        admin_row = cur.fetchone()
+        is_admin = bool(admin_row and admin_row[0])
+        copy_id = None
         if copy_from_template_id is not None:
             try:
-                copy_from_template_id = int(copy_from_template_id)
+                copy_id = int(copy_from_template_id)
             except (TypeError, ValueError):
-                copy_from_template_id = None
-            if copy_from_template_id and copy_from_template_id != new_template_id:
+                pass
+        if is_admin:
+            source_val = 'admin'
+            parent_id = None
+        elif copy_id and copy_id != 0:
+            source_val = 'variant'
+            parent_id = copy_id
+        else:
+            source_val = 'scratch'
+            parent_id = None
+        cur.execute("""
+            INSERT INTO tbl_exam_sheet_template (course_id, segment_label, created_by_user_id, template_name, catalog_course_id, source, parent_template_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING template_id;
+        """, (course_id, segment, user_id, template_name, catalog_id, source_val, parent_id))
+        new_template_id = cur.fetchone()[0]
+
+        if copy_id and copy_id != new_template_id:
                 _ensure_uncategorized_topic(cur)
                 cur.execute("""
                     SELECT 1 FROM tbl_exam_sheet_template
                     WHERE template_id = %s AND course_id = %s;
-                """, (copy_from_template_id, course_id))
+                """, (copy_id, course_id))
                 if cur.fetchone():
                     cur.execute("""
                         INSERT INTO tbl_exam_sheet_template_topic (template_id, topic_handle, topic_order, include_flag)
                         SELECT %s, topic_handle, topic_order, include_flag
                         FROM tbl_exam_sheet_template_topic
                         WHERE template_id = %s;
-                    """, (new_template_id, copy_from_template_id))
+                    """, (new_template_id, copy_id))
                     cur.execute("""
                         INSERT INTO tbl_exam_sheet_template_item (template_id, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode, hide_name)
                         SELECT %s, item_type, item_handle, topic_handle, item_order, include_flag, worked_example_mode, COALESCE(hide_name, false)
                         FROM tbl_exam_sheet_template_item
                         WHERE template_id = %s;
-                    """, (new_template_id, copy_from_template_id))
+                    """, (new_template_id, copy_id))
 
         conn.commit()
         cur.close()
