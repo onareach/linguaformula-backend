@@ -3813,13 +3813,48 @@ def api_catalog_courses_import():
     return jsonify({"inserted": inserted, "updated": updated})
 
 
-# ---------- Catalog course templates (terms/formulas per catalog course, admin only) ----------
-@app.route('/api/catalog-courses/<int:catalog_course_id>/terms', methods=['GET'])
-def api_catalog_course_terms_list(catalog_course_id):
-    """List template terms for a catalog course. Auth required (setup page)."""
-    claims, err = _get_current_user(), None
+# ---------- Catalog course templates (terms/formulas per catalog course and segment, admin only) ----------
+@app.route('/api/catalog-courses/<int:catalog_course_id>/segments', methods=['GET'])
+def api_catalog_course_segments_list(catalog_course_id):
+    """List distinct segment labels for a catalog course (from terms and formulas). Auth required (setup page)."""
+    claims = _get_current_user()
     if not claims:
         return jsonify({"error": "Not authenticated"}), 401
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM tbl_catalog_course WHERE catalog_course_id = %s;", (catalog_course_id,))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Catalog course not found"}), 404
+        cur.execute("""
+            SELECT DISTINCT COALESCE(TRIM(segment_label), '') AS seg
+            FROM (
+                SELECT segment_label FROM tbl_catalog_course_term WHERE catalog_course_id = %s
+                UNION
+                SELECT segment_label FROM tbl_catalog_course_formula WHERE catalog_course_id = %s
+            ) x
+            WHERE TRIM(COALESCE(segment_label, '')) <> ''
+            ORDER BY seg;
+        """, (catalog_course_id, catalog_course_id))
+        segments = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return jsonify({"segments": segments})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/catalog-courses/<int:catalog_course_id>/terms', methods=['GET'])
+def api_catalog_course_terms_list(catalog_course_id):
+    """List template terms for a catalog course and segment. Auth required (setup page). Query param: segment (required)."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Not authenticated"}), 401
+    segment = (request.args.get("segment") or "").strip()
+    if not segment:
+        return jsonify({"error": "segment query parameter is required"}), 400
     try:
         conn = _auth_db()
         cur = conn.cursor()
@@ -3829,8 +3864,9 @@ def api_catalog_course_terms_list(catalog_course_id):
             FROM tbl_catalog_course_term cct
             JOIN tbl_term t ON t.term_id = cct.term_id
             WHERE cct.catalog_course_id = %s
-            ORDER BY cct.segment_label NULLS LAST, cct.display_order NULLS LAST, t.term_name;
-        """, (catalog_course_id,))
+              AND TRIM(COALESCE(cct.segment_label, '')) = %s
+            ORDER BY cct.display_order NULLS LAST, t.term_name;
+        """, (catalog_course_id, segment))
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -3853,7 +3889,7 @@ def api_catalog_course_terms_list(catalog_course_id):
 
 @app.route('/api/catalog-courses/<int:catalog_course_id>/terms', methods=['POST'])
 def api_catalog_course_term_add(catalog_course_id):
-    """Add a term to a catalog course template (admin only). Body: term_id, segment_label (optional)."""
+    """Add a term to a catalog course template (admin only). Body: term_id, segment_label (required)."""
     claims, err = _require_admin()
     if err:
         return err[0], err[1]
@@ -3863,7 +3899,9 @@ def api_catalog_course_term_add(catalog_course_id):
         if term_id is None:
             return jsonify({"error": "term_id is required"}), 400
         term_id = int(term_id)
-        segment_label = (data.get("segment_label") or data.get("segment") or "").strip() or None
+        segment_label = (data.get("segment_label") or data.get("segment") or "").strip()
+        if not segment_label:
+            return jsonify({"error": "segment_label is required"}), 400
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM tbl_catalog_course WHERE catalog_course_id = %s;", (catalog_course_id,))
@@ -3967,10 +4005,13 @@ def api_catalog_course_term_remove(catalog_course_id, catalog_course_term_id):
 
 @app.route('/api/catalog-courses/<int:catalog_course_id>/formulas', methods=['GET'])
 def api_catalog_course_formulas_list(catalog_course_id):
-    """List template formulas for a catalog course. Auth required (setup page)."""
+    """List template formulas for a catalog course and segment. Auth required (setup page). Query param: segment (required)."""
     claims = _get_current_user()
     if not claims:
         return jsonify({"error": "Not authenticated"}), 401
+    segment = (request.args.get("segment") or "").strip()
+    if not segment:
+        return jsonify({"error": "segment query parameter is required"}), 400
     try:
         conn = _auth_db()
         cur = conn.cursor()
@@ -3980,8 +4021,9 @@ def api_catalog_course_formulas_list(catalog_course_id):
             FROM tbl_catalog_course_formula ccf
             JOIN tbl_formula f ON f.formula_id = ccf.formula_id
             WHERE ccf.catalog_course_id = %s
-            ORDER BY ccf.segment_label NULLS LAST, ccf.display_order NULLS LAST, f.formula_name;
-        """, (catalog_course_id,))
+              AND TRIM(COALESCE(ccf.segment_label, '')) = %s
+            ORDER BY ccf.display_order NULLS LAST, f.formula_name;
+        """, (catalog_course_id, segment))
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -4004,7 +4046,7 @@ def api_catalog_course_formulas_list(catalog_course_id):
 
 @app.route('/api/catalog-courses/<int:catalog_course_id>/formulas', methods=['POST'])
 def api_catalog_course_formula_add(catalog_course_id):
-    """Add a formula to a catalog course template (admin only). Body: formula_id, segment_label (optional)."""
+    """Add a formula to a catalog course template (admin only). Body: formula_id, segment_label (required)."""
     claims, err = _require_admin()
     if err:
         return err[0], err[1]
@@ -4014,7 +4056,9 @@ def api_catalog_course_formula_add(catalog_course_id):
         if formula_id is None:
             return jsonify({"error": "formula_id is required"}), 400
         formula_id = int(formula_id)
-        segment_label = (data.get("segment_label") or data.get("segment") or "").strip() or None
+        segment_label = (data.get("segment_label") or data.get("segment") or "").strip()
+        if not segment_label:
+            return jsonify({"error": "segment_label is required"}), 400
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM tbl_catalog_course WHERE catalog_course_id = %s;", (catalog_course_id,))
@@ -4490,12 +4534,16 @@ def api_course_delete(course_id):
 
 @app.route('/api/courses/<int:course_id>/apply-template', methods=['POST'])
 def api_course_apply_template(course_id):
-    """Copy catalog course template (terms + formulas by segment) to the user's course. Auth required; course must have catalog_course_id."""
+    """Copy catalog course template for a segment (terms + formulas) to the user's course. Auth required; course must have catalog_course_id. Body: segment_label (required)."""
     try:
         claims = _get_current_user()
         if not claims:
             return jsonify({"error": "Not authenticated"}), 401
         user_id = claims["user_id"]
+        data = request.get_json() or {}
+        segment_label = (str(data.get("segment_label") or data.get("segment") or "").strip() or None)
+        if not segment_label:
+            return jsonify({"error": "segment_label is required"}), 400
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute(
@@ -4515,13 +4563,34 @@ def api_course_apply_template(course_id):
             conn.close()
             return jsonify({"error": "This course has no template. Use custom to add formulas and terms."}), 400
         cur.execute("""
-            SELECT term_id, segment_label FROM tbl_catalog_course_term WHERE catalog_course_id = %s;
-        """, (catalog_course_id,))
+            SELECT term_id, segment_label FROM tbl_catalog_course_term
+            WHERE catalog_course_id = %s AND LOWER(TRIM(COALESCE(segment_label, ''))) = LOWER(TRIM(%s));
+        """, (catalog_course_id, segment_label))
         term_rows = cur.fetchall()
         cur.execute("""
-            SELECT formula_id, segment_label FROM tbl_catalog_course_formula WHERE catalog_course_id = %s;
-        """, (catalog_course_id,))
+            SELECT formula_id, segment_label FROM tbl_catalog_course_formula
+            WHERE catalog_course_id = %s AND LOWER(TRIM(COALESCE(segment_label, ''))) = LOWER(TRIM(%s));
+        """, (catalog_course_id, segment_label))
         formula_rows = cur.fetchall()
+        # Count distinct questions linked to these terms and formulas (for the success message)
+        term_ids = [r[0] for r in term_rows]
+        formula_ids = [r[0] for r in formula_rows]
+        question_count = 0
+        if term_ids or formula_ids:
+            parts, params = [], []
+            if formula_ids:
+                parts.append("SELECT question_id FROM tbl_formula_question WHERE formula_id = ANY(%s)")
+                params.append(formula_ids)
+            if term_ids:
+                parts.append("SELECT question_id FROM tbl_term_question WHERE term_id = ANY(%s)")
+                params.append(term_ids)
+            cur.execute(
+                "SELECT COUNT(DISTINCT qid) FROM ("
+                + " UNION ".join(parts)
+                + ") AS u(qid)",
+                params,
+            )
+            question_count = cur.fetchone()[0] or 0
         inserted_terms = 0
         inserted_formulas = 0
         for term_id, seg in term_rows:
@@ -4553,6 +4622,7 @@ def api_course_apply_template(course_id):
             "message": "Template applied",
             "inserted_terms": inserted_terms,
             "inserted_formulas": inserted_formulas,
+            "question_count": question_count,
         }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -4662,12 +4732,13 @@ def api_course_questions(course_id):
 
 @app.route('/api/courses/<int:course_id>/formulas', methods=['GET'])
 def api_course_formulas_list(course_id):
-    """List formulas linked to this course for the current user. Auth required; user must be enrolled."""
+    """List formulas linked to this course for the current user. Auth required; user must be enrolled. Query param: segment (optional filter)."""
     try:
         claims = _get_current_user()
         if not claims:
             return jsonify({"error": "Not authenticated"}), 401
         user_id = claims["user_id"]
+        segment = (str(request.args.get("segment") or "")).strip() or None
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute("""
@@ -4677,15 +4748,27 @@ def api_course_formulas_list(course_id):
             cur.close()
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
-        cur.execute("""
-            SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order, ucf.segment_label,
-                   f.topic_handle, t.topic_name
-            FROM tbl_user_course_formula ucf
-            JOIN tbl_formula f ON f.formula_id = ucf.formula_id
-            LEFT JOIN tbl_topic t ON t.topic_handle = f.topic_handle
-            WHERE ucf.user_id = %s AND ucf.course_id = %s
-            ORDER BY ucf.display_order NULLS LAST, f.formula_name;
-        """, (user_id, course_id))
+        if segment:
+            cur.execute("""
+                SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order, ucf.segment_label,
+                       f.topic_handle, t.topic_name
+                FROM tbl_user_course_formula ucf
+                JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+                LEFT JOIN tbl_topic t ON t.topic_handle = f.topic_handle
+                WHERE ucf.user_id = %s AND ucf.course_id = %s
+                  AND LOWER(TRIM(COALESCE(ucf.segment_label, ''))) = LOWER(TRIM(%s))
+                ORDER BY ucf.display_order NULLS LAST, f.formula_name;
+            """, (user_id, course_id, segment))
+        else:
+            cur.execute("""
+                SELECT f.formula_id, f.formula_name, f.latex, ucf.display_order, ucf.segment_label,
+                       f.topic_handle, t.topic_name
+                FROM tbl_user_course_formula ucf
+                JOIN tbl_formula f ON f.formula_id = ucf.formula_id
+                LEFT JOIN tbl_topic t ON t.topic_handle = f.topic_handle
+                WHERE ucf.user_id = %s AND ucf.course_id = %s
+                ORDER BY ucf.display_order NULLS LAST, f.formula_name;
+            """, (user_id, course_id))
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -4856,12 +4939,13 @@ def api_all_course_terms_list():
 
 @app.route('/api/courses/<int:course_id>/terms', methods=['GET'])
 def api_course_terms_list(course_id):
-    """List terms linked to this course for the current user. Auth required; user must be enrolled."""
+    """List terms linked to this course for the current user. Auth required; user must be enrolled. Query param: segment (optional filter)."""
     try:
         claims = _get_current_user()
         if not claims:
             return jsonify({"error": "Not authenticated"}), 401
         user_id = claims["user_id"]
+        segment = (str(request.args.get("segment") or "")).strip() or None
         conn = _auth_db()
         cur = conn.cursor()
         cur.execute("""
@@ -4871,15 +4955,27 @@ def api_course_terms_list(course_id):
             cur.close()
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
-        cur.execute("""
-            SELECT t.term_id, t.term_name, t.definition, uct.display_order, uct.segment_label,
-                   t.topic_handle, tp.topic_name
-            FROM tbl_user_course_term uct
-            JOIN tbl_term t ON t.term_id = uct.term_id
-            LEFT JOIN tbl_topic tp ON tp.topic_handle = t.topic_handle
-            WHERE uct.user_id = %s AND uct.course_id = %s
-            ORDER BY uct.display_order NULLS LAST, t.term_name;
-        """, (user_id, course_id))
+        if segment:
+            cur.execute("""
+                SELECT t.term_id, t.term_name, t.definition, uct.display_order, uct.segment_label,
+                       t.topic_handle, tp.topic_name
+                FROM tbl_user_course_term uct
+                JOIN tbl_term t ON t.term_id = uct.term_id
+                LEFT JOIN tbl_topic tp ON tp.topic_handle = t.topic_handle
+                WHERE uct.user_id = %s AND uct.course_id = %s
+                  AND LOWER(TRIM(COALESCE(uct.segment_label, ''))) = LOWER(TRIM(%s))
+                ORDER BY uct.display_order NULLS LAST, t.term_name;
+            """, (user_id, course_id, segment))
+        else:
+            cur.execute("""
+                SELECT t.term_id, t.term_name, t.definition, uct.display_order, uct.segment_label,
+                       t.topic_handle, tp.topic_name
+                FROM tbl_user_course_term uct
+                JOIN tbl_term t ON t.term_id = uct.term_id
+                LEFT JOIN tbl_topic tp ON tp.topic_handle = t.topic_handle
+                WHERE uct.user_id = %s AND uct.course_id = %s
+                ORDER BY uct.display_order NULLS LAST, t.term_name;
+            """, (user_id, course_id))
         rows = cur.fetchall()
         cur.close()
         conn.close()
@@ -4897,6 +4993,84 @@ def api_course_terms_list(course_id):
                 for r in rows
             ]
         })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/segments', methods=['GET'])
+def api_course_segments_list(course_id):
+    """List distinct segment labels that have at least one formula or term for this course (current user). Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("""
+            SELECT DISTINCT COALESCE(TRIM(segment_label), '') AS seg
+            FROM (
+                SELECT segment_label FROM tbl_user_course_formula WHERE user_id = %s AND course_id = %s
+                UNION
+                SELECT segment_label FROM tbl_user_course_term WHERE user_id = %s AND course_id = %s
+            ) x
+            WHERE TRIM(COALESCE(segment_label, '')) <> ''
+            ORDER BY seg;
+        """, (user_id, course_id, user_id, course_id))
+        segments = [r[0] for r in cur.fetchall()]
+        cur.close()
+        conn.close()
+        return jsonify({"segments": segments})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route('/api/courses/<int:course_id>/clear-segment', methods=['POST'])
+def api_course_clear_segment(course_id):
+    """Remove all formulas and terms for the current user in this course and segment. Body: segment_label (required). Auth required; user must be enrolled."""
+    try:
+        claims = _get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        data = request.get_json() or {}
+        segment_label = (str(data.get("segment_label") or data.get("segment") or "").strip() or None)
+        if not segment_label:
+            return jsonify({"error": "segment_label is required"}), 400
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT 1 FROM tbl_user_course WHERE user_id = %s AND course_id = %s;
+        """, (user_id, course_id))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Course not found or you are not enrolled"}), 404
+        cur.execute("""
+            DELETE FROM tbl_user_course_formula
+            WHERE user_id = %s AND course_id = %s AND LOWER(TRIM(COALESCE(segment_label, ''))) = LOWER(TRIM(%s));
+        """, (user_id, course_id, segment_label))
+        deleted_formulas = cur.rowcount
+        cur.execute("""
+            DELETE FROM tbl_user_course_term
+            WHERE user_id = %s AND course_id = %s AND LOWER(TRIM(COALESCE(segment_label, ''))) = LOWER(TRIM(%s));
+        """, (user_id, course_id, segment_label))
+        deleted_terms = cur.rowcount
+        conn.commit()
+        cur.close()
+        conn.close()
+        return jsonify({
+            "message": "Segment content removed",
+            "deleted_formulas": deleted_formulas,
+            "deleted_terms": deleted_terms,
+        }), 200
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -5234,7 +5408,7 @@ def _load_exam_sheet_template_for_user(user_id, course_id, segment, template_id)
 
 @app.route('/api/exam_sheet/templates', methods=['GET'])
 def api_exam_sheet_templates_list():
-    """List exam-sheet templates for a course+segment. Auth required; user must be enrolled."""
+    """List exam-sheet templates for a course+segment. Auth required; user must be enrolled. Segment is required."""
     try:
         claims = _get_current_user()
         if not claims:
@@ -5248,7 +5422,8 @@ def api_exam_sheet_templates_list():
         except (TypeError, ValueError):
             return jsonify({"error": "course_id must be an integer"}), 400
         segment = (str(request.args.get("segment") or "")).strip() or None
-        all_segments = request.args.get("all_segments") in ("1", "true", "yes")
+        if not segment:
+            return jsonify({"error": "segment is required"}), 400
 
         conn = _auth_db()
         cur = conn.cursor()
@@ -5261,31 +5436,18 @@ def api_exam_sheet_templates_list():
             conn.close()
             return jsonify({"error": "Course not found or you are not enrolled"}), 404
 
-        if all_segments:
-            cur.execute("""
-                SELECT template_id, template_name, segment_label
-                FROM tbl_exam_sheet_template
-                WHERE course_id = %s
-                ORDER BY COALESCE(TRIM(segment_label), ''), template_id;
-            """, (course_id,))
-            rows = cur.fetchall()
-            templates = [
-                {"template_id": r[0], "template_name": r[1] or "Unnamed", "segment_label": r[2]}
-                for r in rows
-            ]
-        else:
-            cur.execute("""
-                SELECT template_id, template_name
-                FROM tbl_exam_sheet_template
-                WHERE course_id = %s
-                  AND COALESCE(TRIM(segment_label), '') = COALESCE(TRIM(%s), '')
-                ORDER BY template_id;
-            """, (course_id, segment))
-            rows = cur.fetchall()
-            templates = [
-                {"template_id": r[0], "template_name": r[1] or "Unnamed"}
-                for r in rows
-            ]
+        cur.execute("""
+            SELECT template_id, template_name, segment_label
+            FROM tbl_exam_sheet_template
+            WHERE course_id = %s
+              AND LOWER(TRIM(COALESCE(segment_label, ''))) = LOWER(TRIM(%s))
+            ORDER BY template_id;
+        """, (course_id, segment))
+        rows = cur.fetchall()
+        templates = [
+            {"template_id": r[0], "template_name": r[1] or "Unnamed", "segment_label": r[2]}
+            for r in rows
+        ]
         cur.close()
         conn.close()
         return jsonify({"templates": templates})
