@@ -3887,6 +3887,62 @@ def api_catalog_course_segments_list(catalog_course_id):
         return jsonify({"error": str(e)}), 500
 
 
+@app.route('/api/catalog-courses/<int:catalog_course_id>/segment-stats', methods=['GET'])
+def api_catalog_course_segment_stats(catalog_course_id):
+    """Return term_count, formula_count, question_count for a catalog course segment. Auth required."""
+    claims = _get_current_user()
+    if not claims:
+        return jsonify({"error": "Not authenticated"}), 401
+    seg_id = request.args.get("segment_id")
+    if seg_id is None or str(seg_id).strip() == "":
+        return jsonify({"error": "segment_id query parameter is required"}), 400
+    try:
+        segment_id = int(seg_id)
+    except (TypeError, ValueError):
+        return jsonify({"error": "segment_id must be an integer"}), 400
+    try:
+        conn = _auth_db()
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM tbl_catalog_course WHERE catalog_course_id = %s;", (catalog_course_id,))
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Catalog course not found"}), 404
+        cur.execute(
+            "SELECT term_id FROM tbl_catalog_course_term WHERE catalog_course_id = %s AND segment_id = %s;",
+            (catalog_course_id, segment_id),
+        )
+        term_ids = [r[0] for r in cur.fetchall()]
+        cur.execute(
+            "SELECT formula_id FROM tbl_catalog_course_formula WHERE catalog_course_id = %s AND segment_id = %s;",
+            (catalog_course_id, segment_id),
+        )
+        formula_ids = [r[0] for r in cur.fetchall()]
+        question_count = 0
+        if term_ids or formula_ids:
+            parts, params = [], []
+            if formula_ids:
+                parts.append("SELECT question_id FROM tbl_formula_question WHERE formula_id = ANY(%s)")
+                params.append(formula_ids)
+            if term_ids:
+                parts.append("SELECT question_id FROM tbl_term_question WHERE term_id = ANY(%s)")
+                params.append(term_ids)
+            cur.execute(
+                "SELECT COUNT(DISTINCT qid) FROM (" + " UNION ".join(parts) + ") AS u(qid)",
+                params,
+            )
+            question_count = cur.fetchone()[0] or 0
+        cur.close()
+        conn.close()
+        return jsonify({
+            "term_count": len(term_ids),
+            "formula_count": len(formula_ids),
+            "question_count": question_count,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/api/catalog-courses/<int:catalog_course_id>/segments', methods=['POST'])
 def api_catalog_course_segment_create(catalog_course_id):
     """Create a segment for a catalog course (admin only). Body: segment_name (required), segment_handle (optional, defaults to slug)."""
@@ -7011,6 +7067,10 @@ def get_application_image(application_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
+from guided_learning_routes import register_guided_learning_routes
+
+register_guided_learning_routes(app, _auth_db, _get_current_user, _require_admin)
 
 if __name__ == '__main__':
     app.run(debug=True)
