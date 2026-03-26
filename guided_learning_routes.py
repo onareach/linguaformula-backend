@@ -1046,22 +1046,185 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
                     "blocks": blocks,
                 }
             )
+        cur.execute(
+            """
+            SELECT s.segment_name, c.course_id
+            FROM tbl_lesson_variant lv
+            JOIN tbl_checkpoint cp ON cp.checkpoint_id = lv.checkpoint_id
+            JOIN tbl_segment s ON s.segment_id = cp.segment_id
+            JOIN tbl_course c ON c.catalog_course_id = s.catalog_course_id
+            JOIN tbl_user_course uc ON uc.course_id = c.course_id AND uc.user_id = %s
+            WHERE lv.lesson_variant_id = %s
+            ORDER BY c.course_id
+            LIMIT 1;
+            """,
+            (user_id, lesson_variant_id),
+        )
+        ctx_row = cur.fetchone()
+        self_testing_context = None
+        if ctx_row is not None:
+            self_testing_context = {
+                "segment_name": ctx_row[0],
+                "course_id": ctx_row[1],
+            }
         cur.close()
         conn.close()
-        return jsonify(
-            {
-                "lesson_variant": {
-                    "lesson_variant_id": vrow[0],
-                    "checkpoint_id": vrow[1],
-                    "variant_label": vrow[2],
-                    "variant_type": vrow[3],
-                    "variant_order_index": vrow[4],
-                    "is_default": vrow[5],
-                    "created_at": vrow[6].isoformat() if vrow[6] else None,
-                    "pages": pages,
-                }
-            }
+        lesson_variant_out = {
+            "lesson_variant_id": vrow[0],
+            "checkpoint_id": vrow[1],
+            "variant_label": vrow[2],
+            "variant_type": vrow[3],
+            "variant_order_index": vrow[4],
+            "is_default": vrow[5],
+            "created_at": vrow[6].isoformat() if vrow[6] else None,
+            "pages": pages,
+        }
+        if self_testing_context is not None:
+            lesson_variant_out["self_testing_context"] = self_testing_context
+        return jsonify({"lesson_variant": lesson_variant_out})
+
+    def _learn_fetch_question_payload(cur, qid):
+        """JSON for learner routes: like admin question shape, plus answer_id and formula_id for self-testing."""
+        cur.execute(
+            """
+            SELECT question_id, question_handle, question_type, stem, explanation, display_order,
+                   parent_question_id
+            FROM tbl_question WHERE question_id = %s;
+            """,
+            (qid,),
         )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        q_id, qhandle, qtype, stem, explanation, display_order, parent_id = row
+        cur.execute(
+            """
+            SELECT a.answer_id, a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+            FROM tbl_question_answer qa
+            INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+            WHERE qa.question_id = %s
+            ORDER BY qa.display_order, qa.question_answer_id;
+            """,
+            (q_id,),
+        )
+        answers = [
+            {
+                "answer_id": r[0],
+                "answer_text": r[1] or "",
+                "answer_numeric": float(r[2]) if r[2] is not None else None,
+                "is_correct": r[3],
+                "display_order": r[4],
+            }
+            for r in cur.fetchall()
+        ]
+        cur.execute("SELECT formula_id FROM tbl_formula_question WHERE question_id = %s;", (q_id,))
+        formula_ids = [r[0] for r in cur.fetchall()]
+        cur.execute("SELECT term_id FROM tbl_term_question WHERE question_id = %s;", (q_id,))
+        term_ids = [r[0] for r in cur.fetchall()]
+        item = {
+            "question_id": q_id,
+            "question_handle": qhandle,
+            "question_type": qtype,
+            "stem": stem or "",
+            "explanation": explanation or "",
+            "display_order": display_order,
+            "answers": answers,
+            "formula_ids": formula_ids,
+            "term_ids": term_ids,
+        }
+        if formula_ids:
+            item["formula_id"] = formula_ids[0]
+        if parent_id is not None:
+            item["parent_question_id"] = parent_id
+        if qtype == "multipart" and parent_id is None:
+            cur.execute(
+                """
+                SELECT question_id, question_handle, part_label, stem, display_order
+                FROM tbl_question
+                WHERE parent_question_id = %s
+                ORDER BY display_order, question_id;
+                """,
+                (q_id,),
+            )
+            parts = []
+            for pr in cur.fetchall():
+                pid, phandle, plabel, pstem, pord = pr
+                cur.execute(
+                    """
+                    SELECT a.answer_id, a.answer_text, a.answer_numeric, qa.is_correct, qa.display_order
+                    FROM tbl_question_answer qa
+                    INNER JOIN tbl_answer a ON a.answer_id = qa.answer_id
+                    WHERE qa.question_id = %s
+                    ORDER BY qa.display_order;
+                    """,
+                    (pid,),
+                )
+                part_answers = [
+                    {
+                        "answer_id": r[0],
+                        "answer_text": r[1] or "",
+                        "answer_numeric": float(r[2]) if r[2] is not None else None,
+                        "is_correct": r[3],
+                        "display_order": r[4],
+                    }
+                    for r in cur.fetchall()
+                ]
+                parts.append(
+                    {
+                        "question_id": pid,
+                        "question_handle": phandle,
+                        "part_label": plabel or "",
+                        "stem": pstem or "",
+                        "display_order": pord,
+                        "answers": part_answers,
+                    }
+                )
+            item["parts"] = parts
+        return item
+
+    @app.route("/api/learn/questions/<int:question_id>", methods=["GET"])
+    def user_get_question_for_lesson(question_id):
+        """Return question JSON for a learner when it is linked from a lesson block they may open.
+
+        Requires `lesson_variant_id` query param; user must be enrolled for that variant's segment
+        and the variant must contain a block with this `linked_question_id`.
+        """
+        claims = get_current_user()
+        if not claims:
+            return jsonify({"error": "Not authenticated"}), 401
+        user_id = claims["user_id"]
+        lvid_raw = request.args.get("lesson_variant_id")
+        if lvid_raw is None or str(lvid_raw).strip() == "":
+            return jsonify({"error": "lesson_variant_id query parameter is required"}), 400
+        try:
+            lesson_variant_id = int(lvid_raw)
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid lesson_variant_id"}), 400
+        if not _user_can_access_lesson_variant(user_id, lesson_variant_id):
+            return jsonify({"error": "Forbidden or not found"}), 403
+
+        conn = auth_db()
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT 1 FROM tbl_lesson_block lb
+            INNER JOIN tbl_lesson_page lp ON lp.lesson_page_id = lb.lesson_page_id
+            WHERE lp.lesson_variant_id = %s AND lb.linked_question_id = %s
+            LIMIT 1;
+            """,
+            (lesson_variant_id, question_id),
+        )
+        if cur.fetchone() is None:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Question is not linked from this lesson"}), 403
+
+        item = _learn_fetch_question_payload(cur, question_id)
+        cur.close()
+        conn.close()
+        if item is None:
+            return jsonify({"error": "Question not found"}), 404
+        return jsonify(item)
 
     # ---------- User: progress ----------
 
