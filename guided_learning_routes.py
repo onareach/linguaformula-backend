@@ -5,7 +5,38 @@ Registered from app.py via register_guided_learning_routes(app, ...).
 from flask import jsonify, request
 from psycopg2.extras import Json
 
+from guided_learning_blocks import validate_image_block_content, verify_media_image_asset
+
 # Whitelist for tbl_user_activity_event.event_type (extend as product evolves)
+def _normalize_block_content_dict(raw):
+    if raw is None:
+        return None
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        import json as _json
+
+        try:
+            o = _json.loads(raw)
+            return o if isinstance(o, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _media_blob_for_block(cur, block_type, media_asset_id):
+    if block_type != "image" or media_asset_id is None:
+        return None, None
+    cur.execute(
+        "SELECT blob_url, mime_type FROM media_assets WHERE media_asset_id = %s;",
+        (media_asset_id,),
+    )
+    mr = cur.fetchone()
+    if not mr:
+        return None, None
+    return mr[0], mr[1]
+
+
 ALLOWED_ACTIVITY_EVENT_TYPES = frozenset(
     {
         "lesson_page_view",
@@ -568,11 +599,14 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
         cur = conn.cursor()
         cur.execute(
             """
-            SELECT lesson_block_id, lesson_page_id, block_type, block_content, block_order_index,
-                   linked_term_id, linked_formula_id, linked_question_id, launch_mode, media_asset_id, created_at
-            FROM tbl_lesson_block
-            WHERE lesson_page_id = %s
-            ORDER BY block_order_index, lesson_block_id;
+            SELECT b.lesson_block_id, b.lesson_page_id, b.block_type, b.block_content, b.block_order_index,
+                   b.linked_term_id, b.linked_formula_id, b.linked_question_id, b.launch_mode, b.media_asset_id,
+                   b.created_at, m.blob_url, m.mime_type
+            FROM tbl_lesson_block b
+            LEFT JOIN media_assets m
+              ON m.media_asset_id = b.media_asset_id AND b.block_type = 'image'
+            WHERE b.lesson_page_id = %s
+            ORDER BY b.block_order_index, b.lesson_block_id;
             """,
             (lesson_page_id,),
         )
@@ -602,6 +636,8 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
                         "launch_mode": r[8],
                         "media_asset_id": r[9],
                         "created_at": r[10].isoformat() if r[10] else None,
+                        "blob_url": r[11],
+                        "mime_type": r[12],
                     }
                     for r in rows
                 ]
@@ -622,12 +658,52 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
         lt = data.get("linked_term_id")
         lf = data.get("linked_formula_id")
         lq = data.get("linked_question_id")
-        launch_mode = (data.get("launch_mode") or "same_tab").strip().lower()
-        if launch_mode not in ("same_tab", "new_tab", "modal"):
-            return jsonify({"error": "invalid launch_mode"}), 400
+        launch_mode_raw = data.get("launch_mode")
         media_asset_id = data.get("media_asset_id")
+
         conn = auth_db()
         cur = conn.cursor()
+
+        if block_type == "image":
+            if media_asset_id is None:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "media_asset_id_required"}), 400
+            try:
+                media_asset_id = int(media_asset_id)
+            except (TypeError, ValueError):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "media_asset_id_invalid"}), 400
+            out_content, v_err = validate_image_block_content(block_content)
+            if v_err:
+                cur.close()
+                conn.close()
+                return jsonify({"error": v_err}), 400
+            if not verify_media_image_asset(cur, media_asset_id):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "media_asset_invalid"}), 400
+            lt = lf = lq = None
+            launch_mode = None
+            block_content = out_content
+        else:
+            if media_asset_id is not None:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "media_asset_id_not_allowed"}), 400
+            media_asset_id = None
+            lm = (launch_mode_raw if launch_mode_raw is not None else "same_tab")
+            if not isinstance(lm, str):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "invalid launch_mode"}), 400
+            launch_mode = lm.strip().lower()
+            if launch_mode not in ("same_tab", "new_tab", "modal"):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "invalid launch_mode"}), 400
+
         cur.execute(
             """
             INSERT INTO tbl_lesson_block (
@@ -652,8 +728,6 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
         )
         r = cur.fetchone()
         conn.commit()
-        cur.close()
-        conn.close()
         bc = r[3]
         if bc is not None and not isinstance(bc, dict):
             try:
@@ -662,6 +736,9 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
                 bc = _json.loads(bc) if isinstance(bc, str) else bc
             except Exception:
                 pass
+        blob_url, mime_type = _media_blob_for_block(cur, r[2], r[9])
+        cur.close()
+        conn.close()
         return (
             jsonify(
                 {
@@ -677,6 +754,8 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
                         "launch_mode": r[8],
                         "media_asset_id": r[9],
                         "created_at": r[10].isoformat() if r[10] else None,
+                        "blob_url": blob_url,
+                        "mime_type": mime_type,
                     }
                 }
             ),
@@ -689,47 +768,131 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
         if err:
             return err[0], err[1]
         data = request.get_json() or {}
+        if not data:
+            return jsonify({"error": "No updatable fields"}), 400
         conn = auth_db()
         cur = conn.cursor()
-        fields = []
-        vals = []
-        if "block_type" in data:
-            fields.append("block_type = %s")
-            vals.append((data.get("block_type") or "").strip())
-        if "block_content" in data:
-            fields.append("block_content = %s")
-            vals.append(Json(data["block_content"]) if data["block_content"] is not None else None)
-        if "block_order_index" in data:
-            fields.append("block_order_index = %s")
-            vals.append(int(data["block_order_index"] or 0))
-        if "linked_term_id" in data:
-            fields.append("linked_term_id = %s")
-            vals.append(data["linked_term_id"])
-        if "linked_formula_id" in data:
-            fields.append("linked_formula_id = %s")
-            vals.append(data["linked_formula_id"])
-        if "linked_question_id" in data:
-            fields.append("linked_question_id = %s")
-            vals.append(data["linked_question_id"])
+        cur.execute(
+            """
+            SELECT lesson_page_id, block_type, block_content, block_order_index,
+                   linked_term_id, linked_formula_id, linked_question_id, launch_mode, media_asset_id
+            FROM tbl_lesson_block WHERE lesson_block_id = %s;
+            """,
+            (lesson_block_id,),
+        )
+        cur_row = cur.fetchone()
+        if not cur_row:
+            cur.close()
+            conn.close()
+            return jsonify({"error": "Block not found"}), 404
+
+        cur_bt = cur_row[1]
+        cur_bc = _normalize_block_content_dict(cur_row[2])
+        cur_bo = cur_row[3]
+        cur_lt, cur_lf, cur_lq = cur_row[4], cur_row[5], cur_row[6]
+        cur_lm, cur_ma = cur_row[7], cur_row[8]
+
+        merged_type = (data.get("block_type") or "").strip() if "block_type" in data else cur_bt
+        if not merged_type:
+            merged_type = cur_bt
+        merged_bc = data["block_content"] if "block_content" in data else cur_bc
+        merged_bo = int(data["block_order_index"] or 0) if "block_order_index" in data else cur_bo
+        merged_lt = data["linked_term_id"] if "linked_term_id" in data else cur_lt
+        merged_lf = data["linked_formula_id"] if "linked_formula_id" in data else cur_lf
+        merged_lq = data["linked_question_id"] if "linked_question_id" in data else cur_lq
         if "launch_mode" in data:
-            lm = (data.get("launch_mode") or "").strip().lower()
-            if lm not in ("same_tab", "new_tab", "modal"):
+            lm = data.get("launch_mode")
+            if lm is None or (isinstance(lm, str) and lm.strip() == ""):
+                merged_lm = "same_tab"
+            elif not isinstance(lm, str) or lm.strip().lower() not in ("same_tab", "new_tab", "modal"):
                 cur.close()
                 conn.close()
                 return jsonify({"error": "invalid launch_mode"}), 400
-            fields.append("launch_mode = %s")
-            vals.append(lm)
-        if "media_asset_id" in data:
-            fields.append("media_asset_id = %s")
-            vals.append(data["media_asset_id"])
-        if not fields:
+            else:
+                merged_lm = lm.strip().lower()
+        else:
+            merged_lm = cur_lm if cur_lm is not None else "same_tab"
+        merged_ma = data["media_asset_id"] if "media_asset_id" in data else cur_ma
+
+        recognized_keys = {
+            "block_type",
+            "block_content",
+            "block_order_index",
+            "linked_term_id",
+            "linked_formula_id",
+            "linked_question_id",
+            "launch_mode",
+            "media_asset_id",
+        }
+        if not any(k in data for k in recognized_keys):
             cur.close()
             conn.close()
             return jsonify({"error": "No updatable fields"}), 400
-        vals.append(lesson_block_id)
+
+        if merged_type == "image":
+            if merged_ma is None:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "media_asset_id_required"}), 400
+            try:
+                merged_ma = int(merged_ma)
+            except (TypeError, ValueError):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "media_asset_id_invalid"}), 400
+            out_content, v_err = validate_image_block_content(merged_bc)
+            if v_err:
+                cur.close()
+                conn.close()
+                return jsonify({"error": v_err}), 400
+            if not verify_media_image_asset(cur, merged_ma):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "media_asset_invalid"}), 400
+            merged_lt = merged_lf = merged_lq = None
+            merged_lm = None
+            merged_bc = out_content
+        else:
+            if "media_asset_id" in data and data["media_asset_id"] is not None:
+                cur.close()
+                conn.close()
+                return jsonify({"error": "media_asset_id_not_allowed"}), 400
+            merged_ma = None
+            if merged_lm is None or (isinstance(merged_lm, str) and merged_lm.strip() == ""):
+                merged_lm = "same_tab"
+            if isinstance(merged_lm, str):
+                merged_lm = merged_lm.strip().lower()
+            if merged_lm not in ("same_tab", "new_tab", "modal"):
+                cur.close()
+                conn.close()
+                return jsonify({"error": "invalid launch_mode"}), 400
+
         cur.execute(
-            f"UPDATE tbl_lesson_block SET {', '.join(fields)} WHERE lesson_block_id = %s RETURNING lesson_block_id, lesson_page_id, block_type, block_content, block_order_index, linked_term_id, linked_formula_id, linked_question_id, launch_mode, media_asset_id, created_at;",
-            vals,
+            """
+            UPDATE tbl_lesson_block SET
+              block_type = %s,
+              block_content = %s,
+              block_order_index = %s,
+              linked_term_id = %s,
+              linked_formula_id = %s,
+              linked_question_id = %s,
+              launch_mode = %s,
+              media_asset_id = %s
+            WHERE lesson_block_id = %s
+            RETURNING lesson_block_id, lesson_page_id, block_type, block_content, block_order_index,
+                      linked_term_id, linked_formula_id, linked_question_id, launch_mode, media_asset_id, created_at;
+            """,
+            (
+                merged_type,
+                Json(merged_bc) if merged_bc is not None else None,
+                merged_bo,
+                merged_lt,
+                merged_lf,
+                merged_lq,
+                merged_lm,
+                merged_ma,
+                lesson_block_id,
+            ),
         )
         r = cur.fetchone()
         if not r:
@@ -738,9 +901,17 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
             conn.close()
             return jsonify({"error": "Block not found"}), 404
         conn.commit()
+        bc = r[3]
+        if bc is not None and not isinstance(bc, dict):
+            try:
+                import json as _json
+
+                bc = _json.loads(bc) if isinstance(bc, str) else bc
+            except Exception:
+                pass
+        blob_url, mime_type = _media_blob_for_block(cur, r[2], r[9])
         cur.close()
         conn.close()
-        bc = r[3]
         return jsonify(
             {
                 "block": {
@@ -755,6 +926,8 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
                     "launch_mode": r[8],
                     "media_asset_id": r[9],
                     "created_at": r[10].isoformat() if r[10] else None,
+                    "blob_url": blob_url,
+                    "mime_type": mime_type,
                 }
             }
         )
@@ -1006,11 +1179,14 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
             pid = prow[0]
             cur.execute(
                 """
-                SELECT lesson_block_id, block_type, block_content, block_order_index,
-                       linked_term_id, linked_formula_id, linked_question_id, launch_mode, media_asset_id
-                FROM tbl_lesson_block
-                WHERE lesson_page_id = %s
-                ORDER BY block_order_index, lesson_block_id;
+                SELECT lb.lesson_block_id, lb.block_type, lb.block_content, lb.block_order_index,
+                       lb.linked_term_id, lb.linked_formula_id, lb.linked_question_id, lb.launch_mode,
+                       lb.media_asset_id, m.blob_url, m.mime_type
+                FROM tbl_lesson_block lb
+                LEFT JOIN media_assets m
+                  ON m.media_asset_id = lb.media_asset_id AND lb.block_type = 'image'
+                WHERE lb.lesson_page_id = %s
+                ORDER BY lb.block_order_index, lb.lesson_block_id;
                 """,
                 (pid,),
             )
@@ -1024,10 +1200,11 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
                         bc = _json.loads(bc) if isinstance(bc, str) else bc
                     except Exception:
                         pass
+                bt = br[1]
                 blocks.append(
                     {
                         "lesson_block_id": br[0],
-                        "block_type": br[1],
+                        "block_type": bt,
                         "block_content": bc,
                         "block_order_index": br[3],
                         "linked_term_id": br[4],
@@ -1035,6 +1212,8 @@ def register_guided_learning_routes(app, auth_db, get_current_user, require_admi
                         "linked_question_id": br[6],
                         "launch_mode": br[7],
                         "media_asset_id": br[8],
+                        "blob_url": br[9] if bt == "image" else None,
+                        "mime_type": br[10] if bt == "image" else None,
                     }
                 )
             pages.append(
